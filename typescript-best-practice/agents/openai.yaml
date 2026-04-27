@@ -1,0 +1,4 @@
+interface:
+  display_name: "TypeScript Best Practice"
+  short_description: "Rule-based TypeScript review guidance"
+  default_prompt: "Use $typescript-best-practice to review TypeScript code for best-practice rule violations."
