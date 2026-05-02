@@ -2,6 +2,8 @@
 
 **Rule:** Mutually exclusive states must be encoded as variants, not as independent optional fields.
 
+**Read when:** A props, options, or config type has optional fields where some combinations are invalid or require different implementation branches.
+
 ❌ **Don't** model mutually exclusive options as independent optional fields:
 
 ```ts
@@ -36,4 +38,4 @@ type TextInputValueProps =
 
 **Allowed exception:** Independent optional fields are fine only when every combination is valid and the implementation handles each combination intentionally.
 
-❔ **Why:** Independent optional fields cannot express exclusivity. A discriminated union makes invalid combinations fail TypeScript instead of requiring callers or implementations to discover them later.
+❔ **Why:** Independent optional fields cannot express exclusivity. A variant union, including variants that exclude incompatible fields with `never`, makes invalid combinations fail TypeScript instead of requiring callers or implementations to discover them later.

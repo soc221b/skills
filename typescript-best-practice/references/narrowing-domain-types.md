@@ -2,6 +2,8 @@
 
 **Rule:** Put domain restrictions in source signatures instead of forcing callers to recover them with assertions.
 
+**Read when:** Callers cast a broad return value or pass unchecked strings, numbers, or literals into an API whose valid domain is narrower.
+
 ❌ **Don't** define source types that are wider than the real domain:
 
 ```ts

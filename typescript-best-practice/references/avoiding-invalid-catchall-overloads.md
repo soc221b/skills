@@ -2,6 +2,8 @@
 
 **Rule:** Public overloads must describe only supported call shapes. Keep loose implementation signatures out of the exported type surface.
 
+**Read when:** A function, method, or interface uses overloads plus a broad rest, `any`, `unknown`, or union signature visible to callers.
+
 ❌ **Don't** add a public catchall overload that accepts calls the API does not support:
 
 ```ts

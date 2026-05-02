@@ -2,6 +2,8 @@
 
 **Rule:** Treat object iteration results as runtime strings unless a known key tuple or runtime guard proves the key set.
 
+**Read when:** Code casts `Object.keys`, `Object.values`, `Object.entries`, `for...in`, or `Reflect.ownKeys` results back to a narrow key or value type.
+
 ❌ **Don't** assert `Object.entries`/`Object.keys`/`Object.values` results back to a narrow key type:
 
 ```ts

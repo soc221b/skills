@@ -2,6 +2,8 @@
 
 **Rule:** Domain-owned runtime values should be the source of truth. Derive types, schemas, options, and adapters from those values.
 
+**Read when:** A domain union is inferred from a schema, UI options, SDK enum, adapter table, or other implementation detail that the domain should own.
+
 ❌ **Don't** make an implementation detail the source of truth for domain-owned values:
 
 ```ts

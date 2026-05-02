@@ -2,6 +2,8 @@
 
 **Rule:** Keep discriminants and their dependent values in the same union variant so narrowing preserves the correlation.
 
+**Read when:** Code narrows one field and then asserts another field because the source type lost the relationship between them.
+
 ❌ **Don't** model correlated states with broad fields and then recover the lost correlation with assertions:
 
 ```ts
@@ -50,5 +52,7 @@ if (result.done) {
   readYieldValue(result.value);
 }
 ```
+
+**Allowed exception:** Keep a broad shape only for raw boundary data before validation, or for a direct mirror of an external API that is immediately adapted into a narrower domain type.
 
 ❔ **Why:** Assertions weaken the application by hiding invalid state combinations that broad types allow, so encode those combinations in narrower source types and let TypeScript reject unsafe inputs.

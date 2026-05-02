@@ -2,6 +2,8 @@
 
 **Rule:** When one value determines another value's valid type, preserve that relationship in the parameter type.
 
+**Read when:** A function accepts multiple parameters where one parameter selects the valid shape or type of another parameter.
+
 ❌ **Don't** model correlated values as independent union parameters when one parameter determines the valid type of another:
 
 ```ts
@@ -42,5 +44,7 @@ getContext({
   options: { colorSpace: "display-p3" },
 }); // Error: 2D-only options are not valid for "bitmaprenderer".
 ```
+
+**Allowed exception:** Keep independent parameters only when every cross-product combination is valid and tested as intentional behavior.
 
 ❔ **Why:** Independent union parameters let callers combine members that do not belong together. Keep the discriminant and dependent value in the same typed variant, or use overloads/keyed generics/rest tuple unions when the existing API needs separate arguments.

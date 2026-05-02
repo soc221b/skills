@@ -2,6 +2,8 @@
 
 **Rule:** Closed finite sets need exhaustive handling when each member has intentional behavior. Use `default` only for real shared behavior.
 
+**Read when:** A `switch`, `if` chain, lookup map, or formatter branches over a literal union, boolean, union enum, or finite template-literal type.
+
 ❌ **Don't** add a catch-all fallback when each member needs intentional handling:
 
 ```ts
@@ -51,5 +53,7 @@ function getReadyStateLabel(state: DocumentReadyState): string {
   }
 }
 ```
+
+**Allowed exception:** Use a `default` branch when the domain rule is genuinely "all remaining members share this behavior."
 
 ❔ **Why:** Closed sets such as literal unions, union enums, booleans, and finite template-literal types are often extended later. Use a `never`-based exhaustive check when a new member should force a code update. A `default` branch is appropriate when the domain rule is genuinely "all other members behave the same," but it should not be used to avoid modeling known member-specific behavior.
