@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=dot && scripts/validate_skill_evals.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3"
+  }
+}
