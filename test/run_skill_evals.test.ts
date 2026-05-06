@@ -9,16 +9,26 @@ import {
   runScript,
 } from "../test_support/skill_eval_fixtures.ts";
 
-function writeFakeCodex(
+function writeFakeClaude(
   fixtureRoot: string,
   body: string = `
-const fs = require("node:fs");
-const outputIndex = process.argv.indexOf("-o");
-if (outputIndex !== -1) {
-  fs.writeFileSync(process.argv[outputIndex + 1], "review output\\n");
+function requireArg(flag, value) {
+  const index = process.argv.indexOf(flag);
+  if (index === -1 || process.argv[index + 1] !== value) {
+    process.stderr.write("missing " + flag + " " + value + "\\n");
+    process.exit(2);
+  }
 }
+if (!process.argv.includes("--print")) {
+  process.stderr.write("missing --print\\n");
+  process.exit(2);
+}
+requireArg("--model", "claude-sonnet-4-6");
+requireArg("--effort", "medium");
+requireArg("--permission-mode", "bypassPermissions");
+requireArg("--output-format", "json");
 process.stdout.write(JSON.stringify({
-  type: "turn.completed",
+  result: "review output\\n",
   usage: {
     input_tokens: 10,
     output_tokens: 5
@@ -26,10 +36,10 @@ process.stdout.write(JSON.stringify({
 }) + "\\n");
 `,
 ): string {
-  const fakeCodex = path.join(fixtureRoot, "fake-codex.cjs");
-  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node\n${body}`);
-  fs.chmodSync(fakeCodex, 0o755);
-  return fakeCodex;
+  const fakeClaude = path.join(fixtureRoot, "fake-claude.cjs");
+  fs.writeFileSync(fakeClaude, `#!/usr/bin/env node\n${body}`);
+  fs.chmodSync(fakeClaude, 0o755);
+  return fakeClaude;
 }
 
 test("run_skill_evals writes the documented workspace with baseline runs", (t) => {
@@ -54,15 +64,15 @@ test("run_skill_evals writes the documented workspace with baseline runs", (t) =
   const result = runNode(
     runScript,
     [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
-    { env: { SKILL_EVAL_CODEX_BIN: writeFakeCodex(fixture.root) } },
+    { env: { SKILL_EVAL_CLAUDE_BIN: writeFakeClaude(fixture.root) } },
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-sample with_skill: exit 0/);
-  assert.match(result.stdout, /eval-sample without_skill: exit 0/);
+  assert.match(result.stdout, /eval-1 with_skill: exit 0/);
+  assert.match(result.stdout, /eval-1 without_skill: exit 0/);
 
   const iterationDir = path.join(fixture.workspace, "iteration-1");
-  const evalDir = path.join(iterationDir, "eval-sample");
+  const evalDir = path.join(iterationDir, "eval-1");
   assert.ok(
     fs.existsSync(path.join(evalDir, "with_skill", "outputs", "output.md")),
   );
@@ -82,6 +92,13 @@ test("run_skill_evals writes the documented workspace with baseline runs", (t) =
   );
   assert.deepEqual(Object.keys(timing).sort(), ["duration_ms", "total_tokens"]);
   assert.equal(timing.total_tokens, 15);
+  assert.equal(
+    fs.readFileSync(
+      path.join(evalDir, "with_skill", "outputs", "output.md"),
+      "utf8",
+    ),
+    "review output\n",
+  );
 });
 
 test("run_skill_evals accepts evals without optional files or assertions", (t) => {
@@ -101,21 +118,18 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
   const result = runNode(
     runScript,
     [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
-    { env: { SKILL_EVAL_CODEX_BIN: writeFakeCodex(fixture.root) } },
+    { env: { SKILL_EVAL_CLAUDE_BIN: writeFakeClaude(fixture.root) } },
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-review-the-skill-instructions with_skill/);
-  assert.match(
-    result.stdout,
-    /eval-review-the-skill-instructions without_skill/,
-  );
+  assert.match(result.stdout, /eval-1 with_skill/);
+  assert.match(result.stdout, /eval-1 without_skill/);
   assert.ok(
     fs.existsSync(
       path.join(
         fixture.workspace,
         "iteration-1",
-        "eval-review-the-skill-instructions",
+        "eval-1",
         "without_skill",
         "outputs",
         "output.md",
@@ -144,27 +158,26 @@ test("run_skill_evals isolates without_skill in a copied input directory", (t) =
     },
   });
 
-  const fakeCodex = writeFakeCodex(
+  const fakeClaude = writeFakeClaude(
     fixture.root,
     `
 const fs = require("node:fs");
-const outputIndex = process.argv.indexOf("-o");
-if (outputIndex !== -1) {
-  fs.writeFileSync(process.argv[outputIndex + 1], [
+process.stdout.write(JSON.stringify({
+  result: [
     "cwd=" + process.cwd(),
     "input=" + fs.existsSync("evals/files/sample.ts"),
     "skill=" + fs.existsSync("SKILL.md"),
     "reference=" + fs.existsSync("references/skill-only.md")
-  ].join("\\n") + "\\n");
-}
-process.stdout.write(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 2 } }) + "\\n");
+  ].join("\\n") + "\\n",
+  usage: { input_tokens: 1, output_tokens: 2 }
+}) + "\\n");
 `,
   );
 
   const result = runNode(
     runScript,
     [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
-    { env: { SKILL_EVAL_CODEX_BIN: fakeCodex } },
+    { env: { SKILL_EVAL_CLAUDE_BIN: fakeClaude } },
   );
 
   assert.equal(result.status, 0, result.stderr);
@@ -172,7 +185,7 @@ process.stdout.write(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 2
   const runDir = path.join(
     fixture.workspace,
     "iteration-1",
-    "eval-sample",
+    "eval-1",
     "without_skill",
   );
   const inputDir = path.join(runDir, "input");
@@ -236,11 +249,11 @@ test("run_skill_evals uses the previous skill snapshot for old_skill baseline", 
       "--old-skill-path",
       oldSkillPath,
     ],
-    { env: { SKILL_EVAL_CODEX_BIN: writeFakeCodex(fixture.root) } },
+    { env: { SKILL_EVAL_CLAUDE_BIN: writeFakeClaude(fixture.root) } },
   );
 
   assert.equal(result.status, 0, result.stderr);
-  const evalDir = path.join(fixture.workspace, "iteration-1", "eval-sample");
+  const evalDir = path.join(fixture.workspace, "iteration-1", "eval-1");
   assert.ok(fs.existsSync(path.join(evalDir, "with_skill", "timing.json")));
   assert.ok(fs.existsSync(path.join(evalDir, "old_skill", "timing.json")));
   assert.equal(fs.existsSync(path.join(evalDir, "without_skill")), false);

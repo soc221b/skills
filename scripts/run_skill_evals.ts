@@ -24,13 +24,15 @@ type CliArgs = {
   oldSkillPath: string | null;
 };
 
-type CodexRunResult = {
+type ClaudeRunResult = {
   duration_ms: number;
   exit_code: number | null;
   stderr: string;
   total_tokens: number | null;
 };
 
+const claudeModel = "claude-sonnet-4-6";
+const claudeEffort = "medium";
 const evalsFileName = path.join("evals", "evals.json");
 
 function usage(): void {
@@ -46,7 +48,8 @@ Options:
   -h, --help           Show this help
 
 Test cases are read from <skill-path>/evals/evals.json.
-Set SKILL_EVAL_CODEX_BIN to choose the executable used for isolated runs.
+Runs use Claude Code with --model ${claudeModel} and --effort ${claudeEffort}.
+Set SKILL_EVAL_CLAUDE_BIN to choose the executable used for isolated runs.
 `);
 }
 
@@ -288,33 +291,8 @@ function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
-function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 72);
-}
-
-function evalDirectoryName(evalCase: EvalCase, usedNames: Set<string>): string {
-  const firstFile = evalCase.files[0];
-  const source = firstFile
-    ? path.basename(firstFile, path.extname(firstFile))
-    : evalCase.prompt;
-  const baseName = `eval-${slugify(source) || evalCase.id}`;
-  let candidate = baseName;
-  if (usedNames.has(candidate)) {
-    candidate = `${baseName}-${evalCase.id}`;
-  }
-
-  let suffix = 2;
-  while (usedNames.has(candidate)) {
-    candidate = `${baseName}-${evalCase.id}-${suffix}`;
-    suffix += 1;
-  }
-
-  usedNames.add(candidate);
-  return candidate;
+function evalDirectoryName(evalCase: EvalCase): string {
+  return `eval-${evalCase.id}`;
 }
 
 function copyInputFiles(
@@ -418,7 +396,7 @@ function extractTotalTokens(jsonl: string): number | null {
       const value = JSON.parse(line);
       found = findTokenValue(value) ?? found;
     } catch {
-      // Non-JSON output is not part of Codex usage accounting.
+      // Non-JSON output is not part of Claude usage accounting.
     }
   }
   return found;
@@ -468,20 +446,91 @@ function findTokenValue(value: unknown): number | null {
   return null;
 }
 
-function runCodex({
+function extractClaudeOutput(stdout: string): string {
+  const trimmed = stdout.trim();
+  if (trimmed === "") {
+    return "";
+  }
+
+  try {
+    const value = JSON.parse(trimmed);
+    if (
+      value &&
+      typeof value === "object" &&
+      typeof (value as Record<string, unknown>).result === "string"
+    ) {
+      return `${(value as Record<string, string>).result.trimEnd()}\n`;
+    }
+  } catch {
+    // Fall back to text or JSONL parsing below.
+  }
+
+  const parts: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const value = JSON.parse(line) as Record<string, unknown>;
+      if (typeof value.result === "string") {
+        parts.push(value.result);
+        continue;
+      }
+      const message = value.message;
+      if (!message || typeof message !== "object") {
+        continue;
+      }
+      const content = (message as Record<string, unknown>).content;
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      for (const item of content) {
+        if (
+          item &&
+          typeof item === "object" &&
+          (item as Record<string, unknown>).type === "text" &&
+          typeof (item as Record<string, unknown>).text === "string"
+        ) {
+          parts.push((item as Record<string, string>).text);
+        }
+      }
+    } catch {
+      return stdout;
+    }
+  }
+
+  return parts.length === 0 ? stdout : `${parts.join("\n").trimEnd()}\n`;
+}
+
+function runClaude({
   workingDir,
   outputFile,
+  outputDir,
   prompt,
 }: {
   workingDir: string;
   outputFile: string;
+  outputDir: string;
   prompt: string;
-}): Promise<CodexRunResult> {
+}): Promise<ClaudeRunResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const child = spawn(
-      process.env.SKILL_EVAL_CODEX_BIN ?? "codex",
-      ["exec", "-C", workingDir, "--json", "-o", outputFile, prompt],
+      process.env.SKILL_EVAL_CLAUDE_BIN ?? "claude",
+      [
+        "--print",
+        "--add-dir",
+        outputDir,
+        "--model",
+        claudeModel,
+        "--effort",
+        claudeEffort,
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "json",
+        prompt,
+      ],
       { cwd: workingDir, stdio: ["ignore", "pipe", "pipe"] },
     );
 
@@ -494,6 +543,7 @@ function runCodex({
     });
     child.on("close", (exitCode) => {
       const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      fs.writeFileSync(outputFile, extractClaudeOutput(stdout));
       resolve({
         duration_ms: Date.now() - startedAt,
         exit_code: exitCode,
@@ -529,9 +579,10 @@ async function runOneConfiguration({
     runDir,
   });
   const outputFile = path.join(outputDir, "output.md");
-  const result = await runCodex({
+  const result = await runClaude({
     workingDir,
     outputFile,
+    outputDir,
     prompt: buildPrompt({
       evalCase,
       runConfiguration,
@@ -575,14 +626,10 @@ async function main(): Promise<void> {
 
   fs.mkdirSync(iterationDir, { recursive: true });
   const runConfigurations: RunConfiguration[] = ["with_skill", args.baseline];
-  const usedEvalDirectoryNames = new Set<string>();
   let exitCode = 0;
 
   for (const evalCase of evals) {
-    const evalDir = path.join(
-      iterationDir,
-      evalDirectoryName(evalCase, usedEvalDirectoryNames),
-    );
+    const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
     fs.mkdirSync(evalDir, { recursive: true });
 
     for (const runConfiguration of runConfigurations) {

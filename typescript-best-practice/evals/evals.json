@@ -3,9 +3,9 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Do not read other files, review evals/files/closed-set-exhaustiveness-1.ts.",
+      "prompt": "Do not read other files, review evals/files/eval-1.ts.",
       "expected_output": "Reviews the formatter as a closed-union exhaustiveness issue and recommends explicitly handling \"json\" plus a never-based exhaustive fallback.",
-      "files": ["evals/files/closed-set-exhaustiveness-1.ts"],
+      "files": ["evals/files/eval-1.ts"],
       "assertions": [
         "The output identifies `ExportFormat` as a closed finite union containing `csv` and `json`.",
         "The output explains that the `default` branch hides the missing explicit `json` case.",
@@ -15,9 +15,9 @@
     },
     {
       "id": 2,
-      "prompt": "Do not read other files, review evals/files/closed-set-exhaustiveness-2.ts.",
+      "prompt": "Do not read other files, review evals/files/eval-2.ts.",
       "expected_output": "Reviews the label helper as a closed-union exhaustiveness issue, including a string return type and a never-based exhaustive fallback.",
-      "files": ["evals/files/closed-set-exhaustiveness-2.ts"],
+      "files": ["evals/files/eval-2.ts"],
       "assertions": [
         "The output identifies `ShippingSpeed` as a closed finite union with exactly three cases.",
         "The output explains that `getShippingSpeedLabel` should return `string` instead of `undefined | string`.",
@@ -26,9 +26,9 @@
     },
     {
       "id": 3,
-      "prompt": "Do not read other files, review evals/files/closed-set-exhaustiveness-3.ts.",
+      "prompt": "Do not read other files, review evals/files/eval-3.ts.",
       "expected_output": "Reviews the role description helper as a closed-union exhaustiveness issue and recommends replacing the unnecessary default return with a never-based exhaustive fallback.",
-      "files": ["evals/files/closed-set-exhaustiveness-3.ts"],
+      "files": ["evals/files/eval-3.ts"],
       "assertions": [
         "The output identifies `UserRole` as a closed finite union.",
         "The output explains that the `default` return is unnecessary because all valid roles are already handled.",
