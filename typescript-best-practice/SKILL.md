@@ -49,11 +49,11 @@ When editing code, keep the diff focused on the type problem. Prefer one clear o
 
 Read only the files that match the issue.
 
-- [Checking closed sets exhaustively](references/checking-closed-sets-exhaustively.md): Closed finite sets use explicit handling or intentional shared defaults.
+- [Checking closed sets exhaustively](references/checking-closed-sets-exhaustively.md): Closed finite sets enumerate known members and reserve `default` for exhaustive checks.
 
 ## Common Fix Shapes
 
-- Closed finite sets: handle every member explicitly when behavior differs, and use a `never` assignment in the final branch to make future omissions fail typecheck.
+- Closed finite sets: handle every known member explicitly, even when members share a return value, and use a `never` assignment in the final branch to make future omissions fail typecheck.
 - Boundary data: parse or validate once at the entry point, then pass typed domain values through internal code.
 - Broad keys: replace `Record<string, T>` or string index signatures with key unions or mapped types when the key space is finite.
 - Correlated values: keep the discriminant and dependent fields in the same union variant, or make the function generic over the discriminant so the relationship survives.

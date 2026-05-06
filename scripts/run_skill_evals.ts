@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,8 +28,52 @@ type CliArgs = {
 type ClaudeRunResult = {
   duration_ms: number;
   exit_code: number | null;
+  output: string;
   stderr: string;
+  stdout: string;
   total_tokens: number | null;
+};
+
+type AssertionResult = {
+  text: string;
+  passed: boolean;
+  evidence: string;
+};
+
+type GradingJson = {
+  assertion_results: AssertionResult[];
+  summary: {
+    passed: number;
+    failed: number;
+    total: number;
+    pass_rate: number | null;
+  };
+};
+
+type RunStats = {
+  failed: number;
+  pass_rate: number | null;
+  passed: number;
+  time_seconds: number;
+  tokens: number;
+  total: number;
+};
+
+type BenchmarkMetric = {
+  mean: number | null;
+  stddev: number | null;
+};
+
+type BenchmarkConfigurationSummary = {
+  pass_rate: BenchmarkMetric;
+  time_seconds: BenchmarkMetric;
+  tokens: BenchmarkMetric;
+};
+
+type OldSkillSnapshot = {
+  path: string;
+  provenance: "copied_from_supplied_snapshot" | "existing_workspace_snapshot";
+  source_path: string;
 };
 
 const claudeModel = "claude-sonnet-4-6";
@@ -38,18 +83,26 @@ const evalsFileName = path.join("evals", "evals.json");
 function usage(): void {
   console.log(`Usage: scripts/run_skill_evals.ts <skill-path> [options]
 
-Runs each documented eval once with the skill and once with a baseline.
+Runs each documented eval once with the skill and once with a baseline, then
+grades assertions, aggregates benchmark.json, and prepares feedback.json.
 
 Options:
   --workspace <dir>    Workspace root (default: sibling <skill-name>-workspace)
   --iteration <n>      Iteration number (default: next available)
   --baseline <mode>    Baseline run: without_skill or old_skill (default: without_skill)
-  --old-skill-path <p> Previous skill snapshot used with --baseline old_skill
+  --old-skill-path <p> Previous skill snapshot copied for old_skill unless workspace snapshot exists
   -h, --help           Show this help
 
 Test cases are read from <skill-path>/evals/evals.json.
 Runs use Claude Code with --model ${claudeModel} and --effort ${claudeEffort}.
 Set SKILL_EVAL_CLAUDE_BIN to choose the executable used for isolated runs.
+
+Optional deterministic grading hook:
+  <skill-path>/evals/verify.mjs, verify.js, or verify.cjs
+  The script is invoked with --evals-json, --eval-id, --output-dir,
+  --run-configuration, and --skill-path. It should print JSON containing
+  assertion_results for any assertions it can verify mechanically; remaining
+  assertions are LLM-graded.
 `);
 }
 
@@ -68,6 +121,16 @@ function readJson(filePath: string): unknown {
 function writeJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(`${filePath}.tmp`, `${JSON.stringify(value, null, 2)}\n`);
+  fs.renameSync(`${filePath}.tmp`, filePath);
+}
+
+function readJsonFile<T>(filePath: string): T {
+  return readJson(filePath) as T;
+}
+
+function writeText(filePath: string, value: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(`${filePath}.tmp`, value);
   fs.renameSync(`${filePath}.tmp`, filePath);
 }
 
@@ -278,9 +341,6 @@ function parseArgs(argv: string[]): CliArgs {
   ) {
     fail("--iteration must be a positive integer");
   }
-  if (args.baseline === "old_skill" && !args.oldSkillPath) {
-    fail("--old-skill-path is required when running old_skill");
-  }
 
   args.skillPath = path.resolve(args.skillPath);
   args.workspace = args.workspace ? path.resolve(args.workspace) : null;
@@ -291,8 +351,212 @@ function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
+const slugStopWords = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "based",
+  "branch",
+  "case",
+  "can",
+  "do",
+  "eval",
+  "evals",
+  "expected",
+  "explicitly",
+  "fallback",
+  "file",
+  "files",
+  "final",
+  "for",
+  "formatter",
+  "from",
+  "handling",
+  "identifies",
+  "in",
+  "is",
+  "it",
+  "issue",
+  "json",
+  "never",
+  "not",
+  "of",
+  "on",
+  "or",
+  "other",
+  "output",
+  "plus",
+  "read",
+  "recommends",
+  "reports",
+  "review",
+  "reviews",
+  "exhaustive",
+  "shows",
+  "ts",
+  "the",
+  "this",
+  "to",
+  "with",
+  "you",
+]);
+
+function slugWords(value: string): string[] {
+  return (value.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(
+    (word) => word.length > 1 && !slugStopWords.has(word),
+  );
+}
+
+function hasFileOnlyPromptShape(
+  prompt: string,
+  promptWords: string[],
+): boolean {
+  const lowerPrompt = prompt.toLowerCase();
+  return (
+    /(?:^|\s)(?:do not read|review)\b/.test(lowerPrompt) &&
+    /(?:^|\s)(?:evals\/files\/|[\w.-]+\.(?:ts|js|tsx|jsx|md|json|csv|txt)\b)/.test(
+      lowerPrompt,
+    ) &&
+    promptWords.length <= 2
+  );
+}
+
+function evalDirectorySlug(evalCase: EvalCase): string {
+  const promptWords = slugWords(evalCase.prompt);
+  const semanticWords = slugWords(
+    [evalCase.expected_output, ...evalCase.assertions].join(" "),
+  );
+  const words =
+    hasFileOnlyPromptShape(evalCase.prompt, promptWords) &&
+    semanticWords.length > 0
+      ? semanticWords
+      : promptWords.length > 0
+        ? promptWords
+        : semanticWords;
+
+  return words.slice(0, 6).join("-") || "case";
+}
+
 function evalDirectoryName(evalCase: EvalCase): string {
-  return `eval-${evalCase.id}`;
+  return `eval-${evalDirectorySlug(evalCase)}-${evalCase.id}`;
+}
+
+function isInsidePath(parent: string, child: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
+function validateWorkspacePath({
+  skillPath,
+  workspace,
+}: {
+  skillPath: string;
+  workspace: string;
+}): void {
+  if (isInsidePath(skillPath, workspace)) {
+    fail("--workspace must be outside the skill directory");
+  }
+}
+
+function validateOldSkillSnapshotPath(oldSkillPath: string): void {
+  const oldSkillFile = path.join(oldSkillPath, "SKILL.md");
+  if (!fs.existsSync(oldSkillFile)) {
+    fail(`${oldSkillPath}: old_skill snapshot must contain SKILL.md`);
+  }
+}
+
+function validateOldSkillIsSeparate({
+  oldSkillPath,
+  skillPath,
+}: {
+  oldSkillPath: string;
+  skillPath: string;
+}): void {
+  if (isInsidePath(skillPath, oldSkillPath)) {
+    fail("--old-skill-path must be a separate previous skill snapshot");
+  }
+}
+
+function copySkillSnapshot({
+  sourcePath,
+  targetPath,
+}: {
+  sourcePath: string;
+  targetPath: string;
+}): void {
+  if (fs.existsSync(targetPath)) {
+    fail(`${targetPath} already exists; old_skill snapshots are immutable`);
+  }
+
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.cpSync(sourcePath, targetPath, { recursive: true });
+}
+
+function prepareOldSkillSnapshot({
+  oldSkillPath,
+  skillPath,
+  workspace,
+}: {
+  oldSkillPath: string | null;
+  skillPath: string;
+  workspace: string;
+}): OldSkillSnapshot {
+  const workspaceSnapshotPath = path.join(workspace, "skill-snapshot");
+  if (fs.existsSync(workspaceSnapshotPath)) {
+    if (
+      oldSkillPath &&
+      path.resolve(oldSkillPath) !== path.resolve(workspaceSnapshotPath)
+    ) {
+      fail(
+        `${workspaceSnapshotPath} already exists; remove it before supplying a different --old-skill-path`,
+      );
+    }
+    validateOldSkillSnapshotPath(workspaceSnapshotPath);
+    validateOldSkillIsSeparate({
+      oldSkillPath: workspaceSnapshotPath,
+      skillPath,
+    });
+    return {
+      path: workspaceSnapshotPath,
+      provenance: "existing_workspace_snapshot",
+      source_path: workspaceSnapshotPath,
+    };
+  }
+
+  if (!oldSkillPath) {
+    fail(
+      "--old-skill-path is required for old_skill unless <workspace>/skill-snapshot already exists",
+    );
+  }
+  validateOldSkillSnapshotPath(oldSkillPath);
+  validateOldSkillIsSeparate({ oldSkillPath, skillPath });
+  copySkillSnapshot({
+    sourcePath: oldSkillPath,
+    targetPath: workspaceSnapshotPath,
+  });
+
+  return {
+    path: workspaceSnapshotPath,
+    provenance: "copied_from_supplied_snapshot",
+    source_path: oldSkillPath,
+  };
+}
+
+function verificationScriptPath(skillPath: string): string | null {
+  for (const fileName of ["verify.mjs", "verify.js", "verify.cjs"]) {
+    const candidate = path.join(skillPath, "evals", fileName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 function copyInputFiles(
@@ -308,30 +572,46 @@ function copyInputFiles(
   }
 }
 
-function workingDirectoryForRun({
+function copyRunSkill({
+  sandboxRoot,
+  sourcePath,
+}: {
+  sandboxRoot: string;
+  sourcePath: string;
+}): string {
+  const sandboxSkillPath = path.join(sandboxRoot, "skill");
+  if (fs.existsSync(sandboxSkillPath)) {
+    fail(`${sandboxSkillPath} already exists; run sandboxes must be fresh`);
+  }
+
+  fs.cpSync(sourcePath, sandboxSkillPath, { recursive: true });
+  return sandboxSkillPath;
+}
+
+function prepareWorkingDirectoryForRun({
   evalCase,
   runConfiguration,
   skillPath,
   oldSkillPath,
-  runDir,
+  sandboxRoot,
 }: {
   evalCase: EvalCase;
   runConfiguration: RunConfiguration;
   skillPath: string;
   oldSkillPath: string | null;
-  runDir: string;
+  sandboxRoot: string;
 }): string {
   if (runConfiguration === "with_skill") {
-    return skillPath;
+    return copyRunSkill({ sandboxRoot, sourcePath: skillPath });
   }
   if (runConfiguration === "old_skill") {
     if (!oldSkillPath) {
       fail("--old-skill-path is required when running old_skill");
     }
-    return oldSkillPath;
+    return copyRunSkill({ sandboxRoot, sourcePath: oldSkillPath });
   }
 
-  const inputDir = path.join(runDir, "input");
+  const inputDir = path.join(sandboxRoot, "input");
   fs.mkdirSync(inputDir, { recursive: true });
   copyInputFiles(skillPath, inputDir, evalCase);
   return inputDir;
@@ -339,25 +619,19 @@ function workingDirectoryForRun({
 
 function buildPrompt({
   evalCase,
-  runConfiguration,
   skillPath,
-  oldSkillPath,
   outputDir,
 }: {
   evalCase: EvalCase;
-  runConfiguration: RunConfiguration;
-  skillPath: string;
-  oldSkillPath: string | null;
+  skillPath: string | null;
   outputDir: string;
 }): string {
   const inputFiles =
     evalCase.files.length === 0 ? "none" : evalCase.files.join(", ");
   const lines = ["Execute this task:"];
 
-  if (runConfiguration === "with_skill") {
+  if (skillPath) {
     lines.push(`- Skill path: ${skillPath}`);
-  } else if (runConfiguration === "old_skill") {
-    lines.push(`- Skill path: ${oldSkillPath}`);
   }
 
   lines.push(
@@ -402,6 +676,23 @@ function extractTotalTokens(jsonl: string): number | null {
   return found;
 }
 
+function extractDurationMs(jsonl: string): number | null {
+  let found: number | null = null;
+  for (const line of jsonl.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const value = JSON.parse(line);
+      found = findDurationMsValue(value) ?? found;
+    } catch {
+      // Non-JSON output is not part of Claude duration accounting.
+    }
+  }
+  return found;
+}
+
 function findTokenValue(value: unknown): number | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -438,6 +729,26 @@ function findTokenValue(value: unknown): number | null {
 
   for (const child of Object.values(record)) {
     const found = findTokenValue(child);
+    if (found !== null) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+function findDurationMsValue(value: unknown): number | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (Number.isFinite(record.duration_ms)) {
+    return record.duration_ms as number;
+  }
+
+  for (const child of Object.values(record)) {
+    const found = findDurationMsValue(child);
     if (found !== null) {
       return found;
     }
@@ -502,25 +813,23 @@ function extractClaudeOutput(stdout: string): string {
   return parts.length === 0 ? stdout : `${parts.join("\n").trimEnd()}\n`;
 }
 
-function runClaude({
+function invokeClaude({
+  addDirs,
   workingDir,
-  outputFile,
-  outputDir,
   prompt,
 }: {
+  addDirs: string[];
   workingDir: string;
-  outputFile: string;
-  outputDir: string;
   prompt: string;
 }): Promise<ClaudeRunResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
+    const addDirArgs = addDirs.flatMap((directory) => ["--add-dir", directory]);
     const child = spawn(
       process.env.SKILL_EVAL_CLAUDE_BIN ?? "claude",
       [
         "--print",
-        "--add-dir",
-        outputDir,
+        ...addDirArgs,
         "--model",
         claudeModel,
         "--effort",
@@ -543,15 +852,639 @@ function runClaude({
     });
     child.on("close", (exitCode) => {
       const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      fs.writeFileSync(outputFile, extractClaudeOutput(stdout));
+      const output = extractClaudeOutput(stdout);
+      const measuredDurationMs = Date.now() - startedAt;
       resolve({
-        duration_ms: Date.now() - startedAt,
+        duration_ms: extractDurationMs(stdout) ?? measuredDurationMs,
         exit_code: exitCode,
+        output,
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        stdout,
         total_tokens: extractTotalTokens(stdout),
       });
     });
   });
+}
+
+function requireTotalTokens(result: ClaudeRunResult, label: string): number {
+  if (result.total_tokens === null) {
+    fail(
+      `${label}: Claude output did not include total token usage; cannot write timing.json`,
+    );
+  }
+  return result.total_tokens;
+}
+
+async function runClaude({
+  workingDir,
+  outputFile,
+  outputDir,
+  prompt,
+}: {
+  workingDir: string;
+  outputFile: string;
+  outputDir: string;
+  prompt: string;
+}): Promise<ClaudeRunResult> {
+  const result = await invokeClaude({
+    addDirs: [outputDir],
+    workingDir,
+    prompt,
+  });
+  writeText(outputFile, result.output);
+  return result;
+}
+
+function summarizeAssertions(
+  results: AssertionResult[],
+): GradingJson["summary"] {
+  const passed = results.filter((result) => result.passed).length;
+  const total = results.length;
+  const failed = total - passed;
+  return {
+    passed,
+    failed,
+    total,
+    pass_rate: total === 0 ? null : passed / total,
+  };
+}
+
+function emptyGrading(): GradingJson {
+  return {
+    assertion_results: [],
+    summary: summarizeAssertions([]),
+  };
+}
+
+function listFilesRecursive(root: string): string[] {
+  if (!fs.existsSync(root)) {
+    return [];
+  }
+
+  const files: string[] = [];
+  function visit(directory: string): void {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(entryPath);
+      } else if (entry.isFile()) {
+        files.push(path.relative(root, entryPath));
+      }
+    }
+  }
+
+  visit(root);
+  return files.sort();
+}
+
+function isReadableText(buffer: Buffer): boolean {
+  if (buffer.includes(0)) {
+    return false;
+  }
+
+  const sample = buffer.subarray(0, 4096);
+  let suspicious = 0;
+  for (const byte of sample) {
+    const isControl = byte < 9 || (byte > 13 && byte < 32);
+    if (isControl) {
+      suspicious += 1;
+    }
+  }
+  return sample.length === 0 || suspicious / sample.length < 0.05;
+}
+
+function outputInventory(outputDir: string): string {
+  const maxTextBytes = 20000;
+  const entries = listFilesRecursive(outputDir);
+  if (entries.length === 0) {
+    return "No output files were produced.\n";
+  }
+
+  return entries
+    .map((relativePath) => {
+      const absolutePath = path.join(outputDir, relativePath);
+      const contents = fs.readFileSync(absolutePath);
+      const stats = fs.statSync(absolutePath);
+      const header = `File: ${relativePath} (${stats.size} bytes)`;
+      if (!isReadableText(contents)) {
+        return `${header}\n[Binary or non-text file; inspect by path if needed.]`;
+      }
+
+      const text = contents.toString("utf8");
+      const truncated =
+        contents.length > maxTextBytes
+          ? `${text.slice(0, maxTextBytes)}\n[Truncated after ${maxTextBytes} bytes.]`
+          : text;
+      return `${header}\n\`\`\`\n${truncated}\n\`\`\``;
+    })
+    .join("\n\n");
+}
+
+function buildGradingPrompt({
+  assertions,
+  evalCase,
+  outputDir,
+}: {
+  assertions: string[];
+  evalCase: EvalCase;
+  outputDir: string;
+}): string {
+  return `Grade this skill eval run against its assertions.
+
+Use only the files in the output directory and the output inventory below. Grade each assertion directly and require concrete evidence for every PASS or FAIL. If the output only gestures at an assertion without satisfying its substance, mark it failed.
+
+Task prompt:
+${evalCase.prompt}
+
+Expected output:
+${evalCase.expected_output}
+
+Output directory:
+${outputDir}
+
+Output inventory:
+${outputInventory(outputDir)}
+
+Assertions to grade, in order:
+${assertions.map((assertion, index) => `${index + 1}. ${assertion}`).join("\n")}
+
+Return only valid JSON with this exact shape and no markdown:
+{
+  "assertion_results": [
+    {
+      "text": "copy the assertion text exactly",
+      "passed": true,
+      "evidence": "quote or reference the concrete output evidence"
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 0,
+    "total": 0,
+    "pass_rate": 0
+  }
+}
+`;
+}
+
+function invokeNodeScript({
+  args,
+  cwd,
+  scriptPath,
+}: {
+  args: string[];
+  cwd: string;
+  scriptPath: string;
+}): Promise<{
+  exit_code: number | null;
+  stderr: string;
+  stdout: string;
+}> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [scriptPath, ...args], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    child.on("error", (error) => {
+      stderrChunks.push(Buffer.from(`${error.message}\n`));
+    });
+    child.on("close", (exitCode) => {
+      resolve({
+        exit_code: exitCode,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      });
+    });
+  });
+}
+
+function parseJsonObjectFromText(text: string, label: string): unknown {
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) {
+      fail(`${label}: expected grader to return a JSON object`);
+    }
+
+    try {
+      return JSON.parse(trimmed.slice(start, end + 1));
+    } catch (error) {
+      fail(`${label}: invalid grader JSON: ${(error as Error).message}`);
+    }
+  }
+}
+
+function normalizeGradingJson(
+  value: unknown,
+  assertions: string[],
+  label: string,
+): GradingJson {
+  assertRecord(value, label);
+  const rawResults = value.assertion_results;
+  if (!Array.isArray(rawResults)) {
+    fail(`${label}.assertion_results must be an array`);
+  }
+  if (rawResults.length !== assertions.length) {
+    fail(
+      `${label}.assertion_results must contain exactly ${assertions.length} results`,
+    );
+  }
+
+  const assertionResults = rawResults.map((rawResult, index) => {
+    assertRecord(rawResult, `${label}.assertion_results[${index}]`);
+    assertAllowedKeys(rawResult, `${label}.assertion_results[${index}]`, [
+      "text",
+      "passed",
+      "evidence",
+    ]);
+
+    const text = rawResult.text;
+    const passed = rawResult.passed;
+    const evidence = rawResult.evidence;
+    if (typeof text !== "string" || text !== assertions[index]) {
+      fail(
+        `${label}.assertion_results[${index}].text must copy the assertion exactly`,
+      );
+    }
+    if (typeof passed !== "boolean") {
+      fail(`${label}.assertion_results[${index}].passed must be a boolean`);
+    }
+    assertString(evidence, `${label}.assertion_results[${index}].evidence`);
+
+    return {
+      text,
+      passed,
+      evidence,
+    };
+  });
+
+  return {
+    assertion_results: assertionResults,
+    summary: summarizeAssertions(assertionResults),
+  };
+}
+
+function normalizeVerificationJson(
+  value: unknown,
+  assertions: string[],
+  label: string,
+): AssertionResult[] {
+  assertRecord(value, label);
+  const rawResults = value.assertion_results;
+  if (!Array.isArray(rawResults)) {
+    fail(`${label}.assertion_results must be an array`);
+  }
+
+  const allowedAssertions = new Set(assertions);
+  const seenAssertions = new Set<string>();
+  return rawResults.map((rawResult, index) => {
+    assertRecord(rawResult, `${label}.assertion_results[${index}]`);
+    assertAllowedKeys(rawResult, `${label}.assertion_results[${index}]`, [
+      "text",
+      "passed",
+      "evidence",
+    ]);
+
+    const text = rawResult.text;
+    const passed = rawResult.passed;
+    const evidence = rawResult.evidence;
+    assertString(text, `${label}.assertion_results[${index}].text`);
+    if (!allowedAssertions.has(text)) {
+      fail(
+        `${label}.assertion_results[${index}].text does not match an eval assertion`,
+      );
+    }
+    if (seenAssertions.has(text)) {
+      fail(`${label}.assertion_results[${index}].text duplicates an assertion`);
+    }
+    seenAssertions.add(text);
+    if (typeof passed !== "boolean") {
+      fail(`${label}.assertion_results[${index}].passed must be a boolean`);
+    }
+    assertString(evidence, `${label}.assertion_results[${index}].evidence`);
+
+    return {
+      text,
+      passed,
+      evidence,
+    };
+  });
+}
+
+async function gradeAssertionsWithLlm({
+  assertions,
+  evalCase,
+  outputDir,
+  label,
+}: {
+  assertions: string[];
+  evalCase: EvalCase;
+  outputDir: string;
+  label: string;
+}): Promise<AssertionResult[]> {
+  if (assertions.length === 0) {
+    return [];
+  }
+
+  const result = await invokeClaude({
+    addDirs: [outputDir],
+    workingDir: outputDir,
+    prompt: buildGradingPrompt({ assertions, evalCase, outputDir }),
+  });
+  if (result.exit_code !== 0) {
+    if (result.stderr.trim()) {
+      console.error(result.stderr.trim());
+    }
+    fail(`${label}: grader failed`);
+  }
+
+  const parsed = parseJsonObjectFromText(result.output, `${label} grading`);
+  return normalizeGradingJson(parsed, assertions, `${label} grading`)
+    .assertion_results;
+}
+
+async function runVerificationScript({
+  evalCase,
+  evalDir,
+  outputDir,
+  runConfiguration,
+  skillPath,
+}: {
+  evalCase: EvalCase;
+  evalDir: string;
+  outputDir: string;
+  runConfiguration: RunConfiguration;
+  skillPath: string;
+}): Promise<AssertionResult[]> {
+  const scriptPath = verificationScriptPath(skillPath);
+  if (!scriptPath) {
+    return [];
+  }
+
+  const evalsJsonPath = path.join(skillPath, evalsFileName);
+  const label = `${path.basename(evalDir)} ${runConfiguration} verification`;
+  const result = await invokeNodeScript({
+    args: [
+      "--evals-json",
+      evalsJsonPath,
+      "--eval-id",
+      String(evalCase.id),
+      "--output-dir",
+      outputDir,
+      "--run-configuration",
+      runConfiguration,
+      "--skill-path",
+      skillPath,
+    ],
+    cwd: skillPath,
+    scriptPath,
+  });
+  if (result.exit_code !== 0) {
+    if (result.stderr.trim()) {
+      console.error(result.stderr.trim());
+    }
+    fail(`${label}: verification script failed`);
+  }
+  if (result.stdout.trim() === "") {
+    return [];
+  }
+
+  const parsed = parseJsonObjectFromText(result.stdout, label);
+  return normalizeVerificationJson(parsed, evalCase.assertions, label);
+}
+
+async function gradeRun({
+  evalCase,
+  evalDir,
+  runConfiguration,
+  skillPath,
+}: {
+  evalCase: EvalCase;
+  evalDir: string;
+  runConfiguration: RunConfiguration;
+  skillPath: string;
+}): Promise<void> {
+  const runDir = path.join(evalDir, runConfiguration);
+  const gradingPath = path.join(runDir, "grading.json");
+  if (evalCase.assertions.length === 0) {
+    writeJson(gradingPath, emptyGrading());
+    return;
+  }
+
+  const outputDir = path.join(runDir, "outputs");
+  const deterministicResults = await runVerificationScript({
+    evalCase,
+    evalDir,
+    outputDir,
+    runConfiguration,
+    skillPath,
+  });
+  const deterministicByText = new Map(
+    deterministicResults.map((result) => [result.text, result]),
+  );
+  const remainingAssertions = evalCase.assertions.filter(
+    (assertion) => !deterministicByText.has(assertion),
+  );
+  const llmResults = await gradeAssertionsWithLlm({
+    assertions: remainingAssertions,
+    evalCase,
+    outputDir,
+    label: `${path.basename(evalDir)} ${runConfiguration}`,
+  });
+  const llmByText = new Map(llmResults.map((result) => [result.text, result]));
+
+  const assertionResults = evalCase.assertions.map((assertion) => {
+    const result =
+      deterministicByText.get(assertion) ?? llmByText.get(assertion);
+    if (!result) {
+      fail(
+        `${path.basename(evalDir)} ${runConfiguration}: missing grade for assertion "${assertion}"`,
+      );
+    }
+    return result;
+  });
+  const grading: GradingJson = {
+    assertion_results: assertionResults,
+    summary: summarizeAssertions(assertionResults),
+  };
+  writeJson(gradingPath, grading);
+  console.log(
+    `${path.basename(evalDir)} ${runConfiguration}: graded ${grading.summary.passed}/${grading.summary.total}`,
+  );
+}
+
+function readTiming(runDir: string): {
+  duration_ms: number;
+  total_tokens: number;
+} {
+  const timingPath = path.join(runDir, "timing.json");
+  const timing = readJsonFile<Record<string, unknown>>(timingPath);
+  assertAllowedKeys(timing, timingPath, ["duration_ms", "total_tokens"]);
+  const durationMs = timing.duration_ms;
+  const totalTokens = timing.total_tokens;
+  if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) {
+    fail(`${timingPath}.duration_ms must be a finite number`);
+  }
+  if (typeof totalTokens !== "number" || !Number.isFinite(totalTokens)) {
+    fail(`${timingPath}.total_tokens must be a finite number`);
+  }
+
+  return {
+    duration_ms: durationMs,
+    total_tokens: totalTokens,
+  };
+}
+
+function readGrading(runDir: string): GradingJson {
+  const gradingPath = path.join(runDir, "grading.json");
+  const grading = readJsonFile<Record<string, unknown>>(gradingPath);
+  assertRecord(grading, gradingPath);
+
+  const rawResults = grading.assertion_results;
+  if (!Array.isArray(rawResults)) {
+    fail(`${gradingPath}.assertion_results must be an array`);
+  }
+
+  const assertionResults = rawResults.map((rawResult, index) => {
+    assertRecord(rawResult, `${gradingPath}.assertion_results[${index}]`);
+    const text = rawResult.text;
+    const passed = rawResult.passed;
+    const evidence = rawResult.evidence;
+    assertString(text, `${gradingPath}.assertion_results[${index}].text`);
+    if (typeof passed !== "boolean") {
+      fail(`${gradingPath}.assertion_results[${index}].passed must be boolean`);
+    }
+    assertString(
+      evidence,
+      `${gradingPath}.assertion_results[${index}].evidence`,
+    );
+    return { text, passed, evidence };
+  });
+
+  return {
+    assertion_results: assertionResults,
+    summary: summarizeAssertions(assertionResults),
+  };
+}
+
+function readRunStats(runDir: string): RunStats {
+  const timing = readTiming(runDir);
+  const grading = readGrading(runDir);
+
+  return {
+    failed: grading.summary.failed,
+    pass_rate: grading.summary.pass_rate,
+    passed: grading.summary.passed,
+    time_seconds: timing.duration_ms / 1000,
+    tokens: timing.total_tokens,
+    total: grading.summary.total,
+  };
+}
+
+function metric(values: Array<number | null>): BenchmarkMetric {
+  const numericValues = values.filter(
+    (value): value is number => value !== null,
+  );
+  if (numericValues.length === 0) {
+    return { mean: null, stddev: null };
+  }
+
+  const mean =
+    numericValues.reduce((sum, value) => sum + value, 0) / numericValues.length;
+  const variance =
+    numericValues.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+    numericValues.length;
+  return {
+    mean,
+    stddev: Math.sqrt(variance),
+  };
+}
+
+function configurationSummary(
+  stats: RunStats[],
+): BenchmarkConfigurationSummary {
+  return {
+    pass_rate: metric(stats.map((stat) => stat.pass_rate)),
+    time_seconds: metric(stats.map((stat) => stat.time_seconds)),
+    tokens: metric(stats.map((stat) => stat.tokens)),
+  };
+}
+
+function metricDelta(
+  withSkill: BenchmarkMetric,
+  baseline: BenchmarkMetric,
+): number | null {
+  if (withSkill.mean === null || baseline.mean === null) {
+    return null;
+  }
+  return withSkill.mean - baseline.mean;
+}
+
+function writeBenchmark({
+  evals,
+  iterationDir,
+  runConfigurations,
+}: {
+  evals: EvalCase[];
+  iterationDir: string;
+  runConfigurations: RunConfiguration[];
+}): void {
+  const runSummary: Record<string, unknown> = {};
+  const summaries: Record<string, BenchmarkConfigurationSummary> = {};
+  for (const runConfiguration of runConfigurations) {
+    const stats = evals.map((evalCase) =>
+      readRunStats(
+        path.join(iterationDir, evalDirectoryName(evalCase), runConfiguration),
+      ),
+    );
+    const summary = configurationSummary(stats);
+    summaries[runConfiguration] = summary;
+    runSummary[runConfiguration] = summary;
+  }
+
+  const baseline = runConfigurations.find(
+    (runConfiguration) => runConfiguration !== "with_skill",
+  );
+  if (baseline) {
+    runSummary.delta = {
+      pass_rate: metricDelta(
+        summaries.with_skill.pass_rate,
+        summaries[baseline].pass_rate,
+      ),
+      time_seconds: metricDelta(
+        summaries.with_skill.time_seconds,
+        summaries[baseline].time_seconds,
+      ),
+      tokens: metricDelta(
+        summaries.with_skill.tokens,
+        summaries[baseline].tokens,
+      ),
+    };
+  }
+
+  writeJson(path.join(iterationDir, "benchmark.json"), {
+    run_summary: runSummary,
+  });
+}
+
+function writeFeedbackJson({
+  evals,
+  iterationDir,
+}: {
+  evals: EvalCase[];
+  iterationDir: string;
+}): void {
+  const feedback = Object.fromEntries(
+    evals.map((evalCase) => [evalDirectoryName(evalCase), ""]),
+  );
+  writeJson(path.join(iterationDir, "feedback.json"), feedback);
 }
 
 async function runOneConfiguration({
@@ -571,40 +1504,154 @@ async function runOneConfiguration({
   const outputDir = path.join(runDir, "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const workingDir = workingDirectoryForRun({
-    evalCase,
-    runConfiguration,
-    skillPath,
-    oldSkillPath,
-    runDir,
-  });
-  const outputFile = path.join(outputDir, "output.md");
-  const result = await runClaude({
-    workingDir,
-    outputFile,
-    outputDir,
-    prompt: buildPrompt({
+  const sandboxRoot = fs.mkdtempSync(
+    path.join(
+      os.tmpdir(),
+      `skill-eval-${path.basename(evalDir)}-${runConfiguration}-`,
+    ),
+  );
+  try {
+    const workingDir = prepareWorkingDirectoryForRun({
       evalCase,
       runConfiguration,
       skillPath,
       oldSkillPath,
+      sandboxRoot,
+    });
+    const outputFile = path.join(outputDir, "output.md");
+    const promptSkillPath =
+      runConfiguration === "without_skill" ? null : workingDir;
+    const prompt = buildPrompt({
+      evalCase,
+      skillPath: promptSkillPath,
       outputDir,
-    }),
+    });
+    const result = await runClaude({
+      workingDir,
+      outputFile,
+      outputDir,
+      prompt,
+    });
+    const totalTokens = requireTotalTokens(
+      result,
+      `${path.basename(evalDir)} ${runConfiguration}`,
+    );
+
+    writeJson(path.join(runDir, "timing.json"), {
+      total_tokens: totalTokens,
+      duration_ms: result.duration_ms,
+    });
+
+    console.log(
+      `${path.basename(evalDir)} ${runConfiguration}: exit ${result.exit_code}`,
+    );
+    if (result.stderr.trim()) {
+      console.error(result.stderr.trim());
+    }
+
+    return result.exit_code ?? 1;
+  } finally {
+    fs.rmSync(sandboxRoot, { recursive: true, force: true });
+  }
+}
+
+async function runAllConfigurations({
+  evals,
+  iterationDir,
+  oldSkillPath,
+  runConfigurations,
+  skillPath,
+}: {
+  evals: EvalCase[];
+  iterationDir: string;
+  oldSkillPath: string | null;
+  runConfigurations: RunConfiguration[];
+  skillPath: string;
+}): Promise<number> {
+  const runTasks = evals.flatMap((evalCase) => {
+    const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
+    return runConfigurations.map((runConfiguration) => ({
+      evalCase,
+      evalDir,
+      runConfiguration,
+    }));
   });
 
-  writeJson(path.join(runDir, "timing.json"), {
-    total_tokens: result.total_tokens,
-    duration_ms: result.duration_ms,
-  });
-
-  console.log(
-    `${path.basename(evalDir)} ${runConfiguration}: exit ${result.exit_code}`,
+  const runResults = await Promise.allSettled(
+    runTasks.map((task) =>
+      runOneConfiguration({
+        ...task,
+        skillPath,
+        oldSkillPath,
+      }),
+    ),
   );
-  if (result.stderr.trim()) {
-    console.error(result.stderr.trim());
+
+  const failures: string[] = [];
+  let exitCode = 0;
+  runResults.forEach((result, index) => {
+    const task = runTasks[index];
+    const label = `${path.basename(task.evalDir)} ${task.runConfiguration}`;
+    if (result.status === "rejected") {
+      failures.push(
+        `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+      );
+    } else if (result.value !== 0) {
+      exitCode = result.value;
+    }
+  });
+
+  if (failures.length > 0) {
+    fail(failures.join("\n"));
   }
 
-  return result.exit_code ?? 1;
+  return exitCode;
+}
+
+async function gradeAllRuns({
+  evals,
+  iterationDir,
+  runConfigurations,
+  skillPath,
+}: {
+  evals: EvalCase[];
+  iterationDir: string;
+  runConfigurations: RunConfiguration[];
+  skillPath: string;
+}): Promise<void> {
+  const gradeTasks = evals.flatMap((evalCase) => {
+    const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
+    return runConfigurations.map((runConfiguration) => ({
+      evalCase,
+      evalDir,
+      runConfiguration,
+    }));
+  });
+
+  const gradeResults = await Promise.allSettled(
+    gradeTasks.map((task) =>
+      gradeRun({
+        ...task,
+        skillPath,
+      }),
+    ),
+  );
+
+  const failures = gradeResults.flatMap((result, index) => {
+    if (result.status === "fulfilled") {
+      return [];
+    }
+
+    const task = gradeTasks[index];
+    const label = `${path.basename(task.evalDir)} ${task.runConfiguration}`;
+    return [
+      `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+    ];
+  });
+
+  if (failures.length > 0) {
+    fail(failures.join("\n"));
+  }
 }
 
 async function main(): Promise<void> {
@@ -618,41 +1665,56 @@ async function main(): Promise<void> {
   const workspace =
     args.workspace ??
     path.join(path.dirname(skillPath), `${skillName}-workspace`);
+  validateWorkspacePath({ skillPath, workspace });
   const iteration = args.iteration ?? nextIteration(workspace);
   const iterationDir = path.join(workspace, `iteration-${iteration}`);
   if (fs.existsSync(iterationDir)) {
     fail(`${iterationDir} already exists; use the next iteration directory`);
   }
+  const oldSkillSnapshot =
+    args.baseline === "old_skill"
+      ? prepareOldSkillSnapshot({
+          oldSkillPath: args.oldSkillPath,
+          skillPath,
+          workspace,
+        })
+      : null;
 
   fs.mkdirSync(iterationDir, { recursive: true });
   const runConfigurations: RunConfiguration[] = ["with_skill", args.baseline];
-  let exitCode = 0;
 
   for (const evalCase of evals) {
     const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
     fs.mkdirSync(evalDir, { recursive: true });
-
-    for (const runConfiguration of runConfigurations) {
-      const runExitCode = await runOneConfiguration({
-        evalCase,
-        evalDir,
-        runConfiguration,
-        skillPath,
-        oldSkillPath: args.oldSkillPath,
-      });
-      if (runExitCode !== 0) {
-        exitCode = runExitCode;
-      }
-    }
   }
+
+  const exitCode = await runAllConfigurations({
+    evals,
+    iterationDir,
+    oldSkillPath: oldSkillSnapshot?.path ?? null,
+    runConfigurations,
+    skillPath,
+  });
+  if (exitCode !== 0) {
+    fail(
+      `One or more eval runs exited non-zero (${exitCode}); not grading or benchmarking failed outputs`,
+    );
+  }
+
+  await gradeAllRuns({
+    evals,
+    iterationDir,
+    runConfigurations,
+    skillPath,
+  });
+
+  writeBenchmark({ evals, iterationDir, runConfigurations });
+  writeFeedbackJson({ evals, iterationDir });
 
   console.log(`Saved eval workspace: ${iterationDir}`);
   console.log(
-    "Next: grade each run into grading.json, then aggregate benchmark.json.",
+    "Next: review eval outputs and grading.json files, then record specific feedback in feedback.json.",
   );
-  if (exitCode !== 0) {
-    process.exitCode = exitCode;
-  }
 }
 
 if (

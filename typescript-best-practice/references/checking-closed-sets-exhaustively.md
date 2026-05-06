@@ -1,6 +1,6 @@
 # Checking Closed Sets Exhaustively
 
-**Rule:** Closed finite sets need exhaustive handling when each member has intentional behavior. Use `default` only for real shared behavior.
+**Rule:** Closed finite sets should enumerate known members explicitly, even when multiple members currently share behavior. Reserve `default` for a `never`-based exhaustive check.
 
 **Read when:** A `switch`, `if` chain, lookup map, or formatter branches over a literal union, boolean, union enum, or finite template-literal type.
 
@@ -40,20 +40,24 @@ function getReadyStateLabel(state: DocumentReadyState): string {
 }
 ```
 
-✅ **Do** keep a `default` branch when it represents real shared behavior for every remaining member:
+✅ **Do** spell out known members even when they share a return value, then keep `default` for exhaustiveness:
 
 ```ts
-/* OK: every non-loading ready state intentionally uses the same label */
+/* OK: future DocumentReadyState variants break this switch */
 function getReadyStateLabel(state: DocumentReadyState): string {
   switch (state) {
     case "loading":
       return "Loading the page";
-    default:
+    case "interactive":
+    case "complete":
       return "Ready to use";
+    default:
+      state satisfies never;
+      throw new Error("Unhandled document ready state");
   }
 }
 ```
 
-**Allowed exception:** Use a `default` branch when the domain rule is genuinely "all remaining members share this behavior."
+**Allowed exception:** Use a real shared `default` only when the domain is intentionally catch-all and a future member should inherit that behavior without forcing a code update.
 
-❔ **Why:** Closed sets such as literal unions, union enums, booleans, and finite template-literal types are often extended later. Use a `never`-based exhaustive check when a new member should force a code update. A `default` branch is appropriate when the domain rule is genuinely "all other members behave the same," but it should not be used to avoid modeling known member-specific behavior.
+❔ **Why:** Closed sets such as literal unions, union enums, booleans, and finite template-literal types are often extended later. A shared `default` return makes known members look indistinguishable from future members, so new cases can slip through silently. Explicit cases document the current domain, while a `never`-based `default` makes omissions fail typecheck.
