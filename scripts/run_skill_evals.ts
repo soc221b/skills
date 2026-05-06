@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type BaselineConfiguration = "without_skill" | "old_skill";
+type AgentProvider = "claude" | "codex";
 type RunConfiguration = "with_skill" | BaselineConfiguration;
 
 type EvalCase = {
@@ -23,15 +24,30 @@ type CliArgs = {
   iteration: number | null;
   baseline: BaselineConfiguration;
   oldSkillPath: string | null;
+  model: string;
+  effort: string;
 };
 
-type ClaudeRunResult = {
+type AgentRunRequest = {
+  addDirs: string[];
+  effort: string;
+  model: string;
+  workingDir: string;
+  prompt: string;
+};
+
+type AgentRunResult = {
   duration_ms: number;
   exit_code: number | null;
   output: string;
   stderr: string;
   stdout: string;
   total_tokens: number | null;
+};
+
+type AgentAdapter = {
+  invoke(request: AgentRunRequest): Promise<AgentRunResult>;
+  provider: AgentProvider;
 };
 
 type AssertionResult = {
@@ -76,8 +92,24 @@ type OldSkillSnapshot = {
   source_path: string;
 };
 
-const claudeModel = "claude-sonnet-4-6";
-const claudeEffort = "medium";
+type RunTask = {
+  evalCase: EvalCase;
+  evalDir: string;
+  runConfiguration: RunConfiguration;
+};
+
+type RunOutcome = {
+  exitCode: number;
+  message: string;
+  stderr: string;
+};
+
+type GradeOutcome = {
+  message: string | null;
+};
+
+const defaultClaudeModel = "claude-sonnet-4-6";
+const defaultClaudeEffort = "high";
 const evalsFileName = path.join("evals", "evals.json");
 
 function usage(): void {
@@ -91,11 +123,13 @@ Options:
   --iteration <n>      Iteration number (default: next available)
   --baseline <mode>    Baseline run: without_skill or old_skill (default: without_skill)
   --old-skill-path <p> Previous skill snapshot copied for old_skill unless workspace snapshot exists
+  --model <name>       Model name (default: ${defaultClaudeModel})
+  --effort <level>     Reasoning effort (default: ${defaultClaudeEffort})
   -h, --help           Show this help
 
 Test cases are read from <skill-path>/evals/evals.json.
-Runs use Claude Code with --model ${claudeModel} and --effort ${claudeEffort}.
-Set SKILL_EVAL_CLAUDE_BIN to choose the executable used for isolated runs.
+Claude models run with Claude Code; other models run with Codex.
+Set SKILL_EVAL_CLAUDE_BIN or SKILL_EVAL_CODEX_BIN to choose the executable used for isolated runs.
 
 Optional deterministic grading hook:
   <skill-path>/evals/verify.mjs, verify.js, or verify.cjs
@@ -305,6 +339,8 @@ function parseArgs(argv: string[]): CliArgs {
     iteration: null,
     baseline: "without_skill",
     oldSkillPath: null,
+    model: defaultClaudeModel,
+    effort: defaultClaudeEffort,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -324,6 +360,10 @@ function parseArgs(argv: string[]): CliArgs {
       args.baseline = baseline;
     } else if (arg === "--old-skill-path") {
       args.oldSkillPath = argv[++index];
+    } else if (arg === "--model") {
+      args.model = argv[++index];
+    } else if (arg === "--effort") {
+      args.effort = argv[++index];
     } else if (!args.skillPath) {
       args.skillPath = arg;
     } else {
@@ -340,6 +380,12 @@ function parseArgs(argv: string[]): CliArgs {
     (!Number.isInteger(args.iteration) || args.iteration < 1)
   ) {
     fail("--iteration must be a positive integer");
+  }
+  if (!args.model || args.model.trim() === "") {
+    fail("--model must be a non-empty string");
+  }
+  if (!args.effort || args.effort.trim() === "") {
+    fail("--effort must be a non-empty string");
   }
 
   args.skillPath = path.resolve(args.skillPath);
@@ -443,6 +489,19 @@ function evalDirectorySlug(evalCase: EvalCase): string {
 
 function evalDirectoryName(evalCase: EvalCase): string {
   return `eval-${evalDirectorySlug(evalCase)}-${evalCase.id}`;
+}
+
+function runTaskLabel(
+  task: Pick<RunTask, "evalDir" | "runConfiguration">,
+): string {
+  return `${path.basename(task.evalDir)} ${task.runConfiguration}`;
+}
+
+function sortedTaskIndexes(tasks: RunTask[]): number[] {
+  return tasks
+    .map((task, index) => ({ index, label: runTaskLabel(task) }))
+    .sort((left, right) => left.label.localeCompare(right.label))
+    .map((entry) => entry.index);
 }
 
 function isInsidePath(parent: string, child: string): boolean {
@@ -670,7 +729,7 @@ function extractTotalTokens(jsonl: string): number | null {
       const value = JSON.parse(line);
       found = findTokenValue(value) ?? found;
     } catch {
-      // Non-JSON output is not part of Claude usage accounting.
+      // Non-JSON output is not part of agent usage accounting.
     }
   }
   return found;
@@ -687,7 +746,7 @@ function extractDurationMs(jsonl: string): number | null {
       const value = JSON.parse(line);
       found = findDurationMsValue(value) ?? found;
     } catch {
-      // Non-JSON output is not part of Claude duration accounting.
+      // Non-JSON output is not part of agent duration accounting.
     }
   }
   return found;
@@ -813,15 +872,17 @@ function extractClaudeOutput(stdout: string): string {
   return parts.length === 0 ? stdout : `${parts.join("\n").trimEnd()}\n`;
 }
 
-function invokeClaude({
+function providerForModel(model: string): AgentProvider {
+  return model.toLowerCase().startsWith("claude") ? "claude" : "codex";
+}
+
+function invokeClaudeCli({
   addDirs,
+  effort,
+  model,
   workingDir,
   prompt,
-}: {
-  addDirs: string[];
-  workingDir: string;
-  prompt: string;
-}): Promise<ClaudeRunResult> {
+}: AgentRunRequest): Promise<AgentRunResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const addDirArgs = addDirs.flatMap((directory) => ["--add-dir", directory]);
@@ -831,9 +892,9 @@ function invokeClaude({
         "--print",
         ...addDirArgs,
         "--model",
-        claudeModel,
+        model,
         "--effort",
-        claudeEffort,
+        effort,
         "--permission-mode",
         "bypassPermissions",
         "--output-format",
@@ -866,28 +927,116 @@ function invokeClaude({
   });
 }
 
-function requireTotalTokens(result: ClaudeRunResult, label: string): number {
+function invokeCodexCli({
+  addDirs,
+  effort,
+  model,
+  workingDir,
+  prompt,
+}: AgentRunRequest): Promise<AgentRunResult> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const outputFile = path.join(
+      os.tmpdir(),
+      `skill-eval-codex-output-${process.pid}-${startedAt}-${Math.random()
+        .toString(36)
+        .slice(2)}.md`,
+    );
+    const addDirArgs = addDirs.flatMap((directory) => ["--add-dir", directory]);
+    const child = spawn(
+      process.env.SKILL_EVAL_CODEX_BIN ?? "codex",
+      [
+        "exec",
+        "--json",
+        "--model",
+        model,
+        "-c",
+        `model_reasoning_effort=${JSON.stringify(effort)}`,
+        "--cd",
+        workingDir,
+        ...addDirArgs,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        outputFile,
+        prompt,
+      ],
+      { cwd: workingDir, stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+    child.on("error", (error) => {
+      stderrChunks.push(Buffer.from(`${error.message}\n`));
+    });
+    child.on("close", (exitCode) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const measuredDurationMs = Date.now() - startedAt;
+      const output = fs.existsSync(outputFile)
+        ? fs.readFileSync(outputFile, "utf8")
+        : extractClaudeOutput(stdout);
+      fs.rmSync(outputFile, { force: true });
+      resolve({
+        duration_ms: extractDurationMs(stdout) ?? measuredDurationMs,
+        exit_code: exitCode,
+        output: output.endsWith("\n") || output === "" ? output : `${output}\n`,
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        stdout,
+        total_tokens: extractTotalTokens(stdout),
+      });
+    });
+  });
+}
+
+const agentAdapters: Record<AgentProvider, AgentAdapter> = {
+  claude: {
+    provider: "claude",
+    invoke: invokeClaudeCli,
+  },
+  codex: {
+    provider: "codex",
+    invoke: invokeCodexCli,
+  },
+};
+
+function adapterForModel(model: string): AgentAdapter {
+  return agentAdapters[providerForModel(model)];
+}
+
+function invokeAgent(request: AgentRunRequest): Promise<AgentRunResult> {
+  return adapterForModel(request.model).invoke(request);
+}
+
+function requireTotalTokens(result: AgentRunResult, label: string): number {
   if (result.total_tokens === null) {
     fail(
-      `${label}: Claude output did not include total token usage; cannot write timing.json`,
+      `${label}: agent output did not include total token usage; cannot write timing.json`,
     );
   }
   return result.total_tokens;
 }
 
-async function runClaude({
+async function runAgent({
+  effort,
+  model,
   workingDir,
   outputFile,
   outputDir,
   prompt,
 }: {
+  effort: string;
+  model: string;
   workingDir: string;
   outputFile: string;
   outputDir: string;
   prompt: string;
-}): Promise<ClaudeRunResult> {
-  const result = await invokeClaude({
+}): Promise<AgentRunResult> {
+  const result = await invokeAgent({
     addDirs: [outputDir],
+    effort,
+    model,
     workingDir,
     prompt,
   });
@@ -1180,12 +1329,16 @@ function normalizeVerificationJson(
 
 async function gradeAssertionsWithLlm({
   assertions,
+  effort,
   evalCase,
+  model,
   outputDir,
   label,
 }: {
   assertions: string[];
+  effort: string;
   evalCase: EvalCase;
+  model: string;
   outputDir: string;
   label: string;
 }): Promise<AssertionResult[]> {
@@ -1193,8 +1346,10 @@ async function gradeAssertionsWithLlm({
     return [];
   }
 
-  const result = await invokeClaude({
+  const result = await invokeAgent({
     addDirs: [outputDir],
+    effort,
+    model,
     workingDir: outputDir,
     prompt: buildGradingPrompt({ assertions, evalCase, outputDir }),
   });
@@ -1261,21 +1416,25 @@ async function runVerificationScript({
 }
 
 async function gradeRun({
+  effort,
   evalCase,
   evalDir,
+  model,
   runConfiguration,
   skillPath,
 }: {
+  effort: string;
   evalCase: EvalCase;
   evalDir: string;
+  model: string;
   runConfiguration: RunConfiguration;
   skillPath: string;
-}): Promise<void> {
+}): Promise<GradeOutcome> {
   const runDir = path.join(evalDir, runConfiguration);
   const gradingPath = path.join(runDir, "grading.json");
   if (evalCase.assertions.length === 0) {
     writeJson(gradingPath, emptyGrading());
-    return;
+    return { message: null };
   }
 
   const outputDir = path.join(runDir, "outputs");
@@ -1294,7 +1453,9 @@ async function gradeRun({
   );
   const llmResults = await gradeAssertionsWithLlm({
     assertions: remainingAssertions,
+    effort,
     evalCase,
+    model,
     outputDir,
     label: `${path.basename(evalDir)} ${runConfiguration}`,
   });
@@ -1315,9 +1476,9 @@ async function gradeRun({
     summary: summarizeAssertions(assertionResults),
   };
   writeJson(gradingPath, grading);
-  console.log(
-    `${path.basename(evalDir)} ${runConfiguration}: graded ${grading.summary.passed}/${grading.summary.total}`,
-  );
+  return {
+    message: `${runTaskLabel({ evalDir, runConfiguration })}: graded ${grading.summary.passed}/${grading.summary.total}`,
+  };
 }
 
 function readTiming(runDir: string): {
@@ -1488,18 +1649,22 @@ function writeFeedbackJson({
 }
 
 async function runOneConfiguration({
+  effort,
   evalCase,
   evalDir,
+  model,
   runConfiguration,
   skillPath,
   oldSkillPath,
 }: {
+  effort: string;
   evalCase: EvalCase;
   evalDir: string;
+  model: string;
   runConfiguration: RunConfiguration;
   skillPath: string;
   oldSkillPath: string | null;
-}): Promise<number> {
+}): Promise<RunOutcome> {
   const runDir = path.join(evalDir, runConfiguration);
   const outputDir = path.join(runDir, "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
@@ -1526,7 +1691,9 @@ async function runOneConfiguration({
       skillPath: promptSkillPath,
       outputDir,
     });
-    const result = await runClaude({
+    const result = await runAgent({
+      effort,
+      model,
       workingDir,
       outputFile,
       outputDir,
@@ -1542,33 +1709,35 @@ async function runOneConfiguration({
       duration_ms: result.duration_ms,
     });
 
-    console.log(
-      `${path.basename(evalDir)} ${runConfiguration}: exit ${result.exit_code}`,
-    );
-    if (result.stderr.trim()) {
-      console.error(result.stderr.trim());
-    }
-
-    return result.exit_code ?? 1;
+    const exitCode = result.exit_code ?? 1;
+    return {
+      exitCode,
+      message: `${runTaskLabel({ evalDir, runConfiguration })}: exit ${exitCode}`,
+      stderr: result.stderr,
+    };
   } finally {
     fs.rmSync(sandboxRoot, { recursive: true, force: true });
   }
 }
 
 async function runAllConfigurations({
+  effort,
   evals,
   iterationDir,
+  model,
   oldSkillPath,
   runConfigurations,
   skillPath,
 }: {
+  effort: string;
   evals: EvalCase[];
   iterationDir: string;
+  model: string;
   oldSkillPath: string | null;
   runConfigurations: RunConfiguration[];
   skillPath: string;
 }): Promise<number> {
-  const runTasks = evals.flatMap((evalCase) => {
+  const runTasks: RunTask[] = evals.flatMap((evalCase) => {
     const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
     return runConfigurations.map((runConfiguration) => ({
       evalCase,
@@ -1581,6 +1750,8 @@ async function runAllConfigurations({
     runTasks.map((task) =>
       runOneConfiguration({
         ...task,
+        effort,
+        model,
         skillPath,
         oldSkillPath,
       }),
@@ -1589,17 +1760,25 @@ async function runAllConfigurations({
 
   const failures: string[] = [];
   let exitCode = 0;
-  runResults.forEach((result, index) => {
+  for (const index of sortedTaskIndexes(runTasks)) {
+    const result = runResults[index];
     const task = runTasks[index];
-    const label = `${path.basename(task.evalDir)} ${task.runConfiguration}`;
+    const label = runTaskLabel(task);
     if (result.status === "rejected") {
       failures.push(
         `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
       );
-    } else if (result.value !== 0) {
-      exitCode = result.value;
+      continue;
     }
-  });
+
+    console.log(result.value.message);
+    if (result.value.stderr.trim()) {
+      console.error(result.value.stderr.trim());
+    }
+    if (result.value.exitCode !== 0 && exitCode === 0) {
+      exitCode = result.value.exitCode;
+    }
+  }
 
   if (failures.length > 0) {
     fail(failures.join("\n"));
@@ -1609,17 +1788,21 @@ async function runAllConfigurations({
 }
 
 async function gradeAllRuns({
+  effort,
   evals,
   iterationDir,
+  model,
   runConfigurations,
   skillPath,
 }: {
+  effort: string;
   evals: EvalCase[];
   iterationDir: string;
+  model: string;
   runConfigurations: RunConfiguration[];
   skillPath: string;
 }): Promise<void> {
-  const gradeTasks = evals.flatMap((evalCase) => {
+  const gradeTasks: RunTask[] = evals.flatMap((evalCase) => {
     const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
     return runConfigurations.map((runConfiguration) => ({
       evalCase,
@@ -1632,22 +1815,29 @@ async function gradeAllRuns({
     gradeTasks.map((task) =>
       gradeRun({
         ...task,
+        effort,
+        model,
         skillPath,
       }),
     ),
   );
 
-  const failures = gradeResults.flatMap((result, index) => {
+  const failures: string[] = [];
+  for (const index of sortedTaskIndexes(gradeTasks)) {
+    const result = gradeResults[index];
     if (result.status === "fulfilled") {
-      return [];
+      if (result.value.message) {
+        console.log(result.value.message);
+      }
+      continue;
     }
 
     const task = gradeTasks[index];
-    const label = `${path.basename(task.evalDir)} ${task.runConfiguration}`;
-    return [
+    const label = runTaskLabel(task);
+    failures.push(
       `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-    ];
-  });
+    );
+  }
 
   if (failures.length > 0) {
     fail(failures.join("\n"));
@@ -1689,8 +1879,10 @@ async function main(): Promise<void> {
   }
 
   const exitCode = await runAllConfigurations({
+    effort: args.effort,
     evals,
     iterationDir,
+    model: args.model,
     oldSkillPath: oldSkillSnapshot?.path ?? null,
     runConfigurations,
     skillPath,
@@ -1702,8 +1894,10 @@ async function main(): Promise<void> {
   }
 
   await gradeAllRuns({
+    effort: args.effort,
     evals,
     iterationDir,
+    model: args.model,
     runConfigurations,
     skillPath,
   });

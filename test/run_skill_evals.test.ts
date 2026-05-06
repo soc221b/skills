@@ -26,7 +26,7 @@ if (!process.argv.includes("--print")) {
   process.exit(2);
 }
 requireArg("--model", "claude-sonnet-4-6");
-requireArg("--effort", "medium");
+requireArg("--effort", "high");
 requireArg("--permission-mode", "bypassPermissions");
 requireArg("--output-format", "json");
 if (prompt.includes("Grade this skill eval run")) {
@@ -70,6 +70,67 @@ process.stdout.write(JSON.stringify({
   fs.writeFileSync(fakeClaude, `#!/usr/bin/env node\n${body}`);
   fs.chmodSync(fakeClaude, 0o755);
   return fakeClaude;
+}
+
+function writeFakeCodex(
+  fixtureRoot: string,
+  body: string = `
+const fs = require("node:fs");
+const prompt = process.argv.at(-1) || "";
+function requireArg(flag, value) {
+  const index = process.argv.indexOf(flag);
+  if (index === -1 || process.argv[index + 1] !== value) {
+    process.stderr.write("missing " + flag + " " + value + "\\n");
+    process.exit(2);
+  }
+}
+if (!process.argv.includes("exec")) {
+  process.stderr.write("missing exec\\n");
+  process.exit(2);
+}
+if (!process.argv.includes("--json")) {
+  process.stderr.write("missing --json\\n");
+  process.exit(2);
+}
+if (!process.argv.includes("--dangerously-bypass-approvals-and-sandbox")) {
+  process.stderr.write("missing bypass flag\\n");
+  process.exit(2);
+}
+requireArg("--model", "gpt-5.5");
+requireArg("-c", "model_reasoning_effort=\\"xhigh\\"");
+const outputIndex = process.argv.indexOf("--output-last-message");
+if (outputIndex === -1 || !process.argv[outputIndex + 1]) {
+  process.stderr.write("missing --output-last-message\\n");
+  process.exit(2);
+}
+const outputPath = process.argv[outputIndex + 1];
+if (prompt.includes("Grade this skill eval run")) {
+  fs.writeFileSync(outputPath, JSON.stringify({
+    assertion_results: [
+      {
+        text: "The output reports the expected issue.",
+        passed: true,
+        evidence: "outputs/output.md contains review output"
+      }
+    ],
+    summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+  }) + "\\n");
+} else {
+  fs.writeFileSync(outputPath, "review output\\n");
+}
+process.stdout.write(JSON.stringify({
+  usage: {
+    input_tokens: 10,
+    output_tokens: 5
+  },
+  duration_ms: 25
+}) + "\\n");
+`,
+): string {
+  const fakeCodex = path.join(fixtureRoot, "fake-codex.cjs");
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node\n${body}`);
+  fs.chmodSync(fakeCodex, 0o755);
+  return fakeCodex;
 }
 
 test("run_skill_evals writes the documented workspace with baseline runs", (t) => {
@@ -170,6 +231,136 @@ test("run_skill_evals writes the documented workspace with baseline runs", (t) =
     fs.readFileSync(path.join(iterationDir, "feedback.json"), "utf8"),
   );
   assert.deepEqual(Object.keys(feedback), [path.basename(evalDir)]);
+});
+
+test("run_skill_evals uses selected Claude model and effort", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review evals/files/sample.ts.",
+          expected_output: "Reports the expected issue.",
+          files: ["evals/files/sample.ts"],
+          assertions: ["The output reports the expected issue."],
+        },
+      ],
+    },
+    files: {
+      "evals/files/sample.ts": "const value = 1;\n",
+    },
+  });
+
+  const fakeClaude = writeFakeClaude(
+    fixture.root,
+    `
+const prompt = process.argv.at(-1) || "";
+function requireArg(flag, value) {
+  const index = process.argv.indexOf(flag);
+  if (index === -1 || process.argv[index + 1] !== value) {
+    process.stderr.write("missing " + flag + " " + value + "\\n");
+    process.exit(2);
+  }
+}
+requireArg("--model", "claude-opus-4-6");
+requireArg("--effort", "medium");
+if (prompt.includes("Grade this skill eval run")) {
+  process.stdout.write(JSON.stringify({
+    result: JSON.stringify({
+      assertion_results: [
+        {
+          text: "The output reports the expected issue.",
+          passed: true,
+          evidence: "outputs/output.md contains review output"
+        }
+      ],
+      summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+    }),
+    usage: { input_tokens: 4, output_tokens: 6 }
+  }) + "\\n");
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({
+  result: "review output\\n",
+  usage: { input_tokens: 10, output_tokens: 5 }
+}) + "\\n");
+`,
+  );
+
+  const result = runNode(
+    runScript,
+    [
+      fixture.skillPath,
+      "--workspace",
+      fixture.workspace,
+      "--iteration",
+      "1",
+      "--model",
+      "claude-opus-4-6",
+      "--effort",
+      "medium",
+    ],
+    { env: { SKILL_EVAL_CLAUDE_BIN: fakeClaude } },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /eval-sample-1 with_skill: exit 0/);
+  assert.match(result.stdout, /eval-sample-1 without_skill: exit 0/);
+});
+
+test("run_skill_evals uses Codex for non-Claude models", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review evals/files/sample.ts.",
+          expected_output: "Reports the expected issue.",
+          files: ["evals/files/sample.ts"],
+          assertions: ["The output reports the expected issue."],
+        },
+      ],
+    },
+    files: {
+      "evals/files/sample.ts": "const value = 1;\n",
+    },
+  });
+
+  const result = runNode(
+    runScript,
+    [
+      fixture.skillPath,
+      "--workspace",
+      fixture.workspace,
+      "--iteration",
+      "1",
+      "--model",
+      "gpt-5.5",
+      "--effort",
+      "xhigh",
+    ],
+    { env: { SKILL_EVAL_CODEX_BIN: writeFakeCodex(fixture.root) } },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /eval-sample-1 with_skill: exit 0/);
+  assert.match(result.stdout, /eval-sample-1 without_skill: exit 0/);
+  assert.equal(
+    fs.readFileSync(
+      path.join(
+        fixture.workspace,
+        "iteration-1",
+        "eval-sample-1",
+        "with_skill",
+        "outputs",
+        "output.md",
+      ),
+      "utf8",
+    ),
+    "review output\n",
+  );
 });
 
 test("run_skill_evals derives semantic names for file-only prompts", (t) => {
@@ -547,6 +738,102 @@ process.stdout.write(JSON.stringify({
   );
 });
 
+test("run_skill_evals prints status lines in sorted order", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review alpha.",
+          expected_output: "Reports the expected alpha issue.",
+          assertions: ["The output reports the expected alpha issue."],
+        },
+        {
+          id: 2,
+          prompt: "Review beta.",
+          expected_output: "Reports the expected beta issue.",
+          assertions: ["The output reports the expected beta issue."],
+        },
+      ],
+    },
+  });
+  const fakeClaude = writeFakeClaude(
+    fixture.root,
+    `
+const prompt = process.argv.at(-1) || "";
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function currentRun() {
+  const match = prompt.match(/iteration-1\\/([^/\\n]+)\\/([^/\\n]+)\\/outputs/);
+  return {
+    evalName: match ? match[1] : "unknown",
+    configuration: match ? match[2] : "unknown"
+  };
+}
+const { evalName, configuration } = currentRun();
+const key = evalName + ":" + configuration;
+if (prompt.includes("Grade this skill eval run")) {
+  sleep({
+    "eval-alpha-1:with_skill": 40,
+    "eval-alpha-1:without_skill": 30,
+    "eval-beta-2:with_skill": 20,
+    "eval-beta-2:without_skill": 10
+  }[key] || 0);
+  process.stdout.write(JSON.stringify({
+    result: JSON.stringify({
+      assertion_results: [
+        {
+          text: evalName === "eval-alpha-1"
+            ? "The output reports the expected alpha issue."
+            : "The output reports the expected beta issue.",
+          passed: true,
+          evidence: "outputs/output.md identifies " + evalName + " " + configuration
+        }
+      ],
+      summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+    }),
+    usage: { input_tokens: 1, output_tokens: 1 }
+  }) + "\\n");
+  process.exit(0);
+}
+sleep({
+  "eval-alpha-1:with_skill": 40,
+  "eval-alpha-1:without_skill": 30,
+  "eval-beta-2:with_skill": 20,
+  "eval-beta-2:without_skill": 10
+}[key] || 0);
+process.stdout.write(JSON.stringify({
+  result: "eval=" + evalName + "\\nconfiguration=" + configuration + "\\n",
+  usage: { input_tokens: 1, output_tokens: 1 }
+}) + "\\n");
+`,
+  );
+
+  const result = runNode(
+    runScript,
+    [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
+    { env: { SKILL_EVAL_CLAUDE_BIN: fakeClaude } },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const statusLines = result.stdout
+    .trim()
+    .split(/\r?\n/)
+    .filter((line) => /: (exit|graded) /.test(line));
+  assert.deepEqual(statusLines, [
+    "eval-alpha-1 with_skill: exit 0",
+    "eval-alpha-1 without_skill: exit 0",
+    "eval-beta-2 with_skill: exit 0",
+    "eval-beta-2 without_skill: exit 0",
+    "eval-alpha-1 with_skill: graded 1/1",
+    "eval-alpha-1 without_skill: graded 1/1",
+    "eval-beta-2 with_skill: graded 1/1",
+    "eval-beta-2 without_skill: graded 1/1",
+  ]);
+});
+
 test("run_skill_evals aggregates multi-eval benchmark means, stddevs, and deltas", (t) => {
   const fixture = makeSkillFixture(t, {
     evalsJson: {
@@ -808,7 +1095,7 @@ process.stdout.write(JSON.stringify({ result: "review output\\n" }) + "\\n");
   assert.equal(result.status, 1);
   assert.match(
     result.stderr,
-    /Claude output did not include total token usage; cannot write timing\.json/,
+    /agent output did not include total token usage; cannot write timing\.json/,
   );
   assert.equal(
     fs.existsSync(
