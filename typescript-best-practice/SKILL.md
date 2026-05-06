@@ -39,6 +39,8 @@ When reviewing code, lead with findings. For each issue, include:
 - the smallest safer change;
 - a short code sketch only when it clarifies the fix.
 
+When an output directory or output file is requested, put the full review and any code sketch in the final response. Do not answer only with a link to a secondary file.
+
 If no type-system issue is present, say so clearly and mention any residual risk, such as unvalidated external data or a public API whose callers were not inspected.
 
 ## Refactor Output
@@ -49,11 +51,11 @@ When editing code, keep the diff focused on the type problem. Prefer one clear o
 
 Read only the files that match the issue.
 
-- [Checking closed sets exhaustively](references/checking-closed-sets-exhaustively.md): Closed finite sets enumerate known members and reserve `default` for exhaustive checks.
+- [Checking closed sets exhaustively](references/checking-closed-sets-exhaustively.md): Closed finite sets enumerate known members and require concrete code with a throwing `never` exhaustive check.
 
 ## Common Fix Shapes
 
-- Closed finite sets: handle every known member explicitly, even when members share a return value, and use a `never` assignment in the final branch to make future omissions fail typecheck.
+- Closed finite sets: handle every known member explicitly, even when members share a return value, and use a throwing `never` guard in the final branch to make future omissions fail typecheck.
 - Boundary data: parse or validate once at the entry point, then pass typed domain values through internal code.
 - Broad keys: replace `Record<string, T>` or string index signatures with key unions or mapped types when the key space is finite.
 - Correlated values: keep the discriminant and dependent fields in the same union variant, or make the function generic over the discriminant so the relationship survives.

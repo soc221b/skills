@@ -100,12 +100,10 @@ type RunTask = {
 
 type RunOutcome = {
   exitCode: number;
-  message: string;
-  stderr: string;
 };
 
 type GradeOutcome = {
-  message: string | null;
+  status: string;
 };
 
 const defaultClaudeModel = "claude-sonnet-4-6";
@@ -497,11 +495,43 @@ function runTaskLabel(
   return `${path.basename(task.evalDir)} ${task.runConfiguration}`;
 }
 
-function sortedTaskIndexes(tasks: RunTask[]): number[] {
-  return tasks
-    .map((task, index) => ({ index, label: runTaskLabel(task) }))
-    .sort((left, right) => left.label.localeCompare(right.label))
-    .map((entry) => entry.index);
+function taskStatusKey({
+  evalCase,
+  runConfiguration,
+}: Pick<RunTask, "evalCase" | "runConfiguration">): string {
+  return `${evalDirectoryName(evalCase)}\0${runConfiguration}`;
+}
+
+function formatGroupedTaskStatuses({
+  evals,
+  runConfigurations,
+  statuses,
+}: {
+  evals: EvalCase[];
+  runConfigurations: RunConfiguration[];
+  statuses: Map<string, string>;
+}): string {
+  return [...evals]
+    .sort(
+      (left, right) =>
+        left.id - right.id ||
+        evalDirectoryName(left).localeCompare(evalDirectoryName(right)),
+    )
+    .map((evalCase) => {
+      const evalName = evalDirectoryName(evalCase);
+      const lines = [evalName];
+      for (const runConfiguration of runConfigurations) {
+        const prefix = runConfiguration === "with_skill" ? "   " : "";
+        lines.push(
+          `${prefix}${runConfiguration}: ${
+            statuses.get(taskStatusKey({ evalCase, runConfiguration })) ??
+            "not completed"
+          }`,
+        );
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
 }
 
 function isInsidePath(parent: string, child: string): boolean {
@@ -690,13 +720,17 @@ function buildPrompt({
   const lines = ["Execute this task:"];
 
   if (skillPath) {
-    lines.push(`- Skill path: ${skillPath}`);
+    lines.push(
+      `- Skill path: ${skillPath}`,
+      `- Read and follow the skill instructions in: ${path.join(skillPath, "SKILL.md")}`,
+    );
   }
 
   lines.push(
     `- Task: ${evalCase.prompt}`,
     `- Input files: ${inputFiles}`,
     `- Save outputs to: ${outputDir}`,
+    `- The final response will be saved to ${path.join(outputDir, "output.md")}; include the complete review and any code fix in the final response, not only links to files.`,
   );
 
   return `${lines.join("\n")}\n`;
@@ -1354,10 +1388,8 @@ async function gradeAssertionsWithLlm({
     prompt: buildGradingPrompt({ assertions, evalCase, outputDir }),
   });
   if (result.exit_code !== 0) {
-    if (result.stderr.trim()) {
-      console.error(result.stderr.trim());
-    }
-    fail(`${label}: grader failed`);
+    const stderr = result.stderr.trim();
+    fail(`${label}: grader failed${stderr ? `: ${stderr}` : ""}`);
   }
 
   const parsed = parseJsonObjectFromText(result.output, `${label} grading`);
@@ -1402,10 +1434,8 @@ async function runVerificationScript({
     scriptPath,
   });
   if (result.exit_code !== 0) {
-    if (result.stderr.trim()) {
-      console.error(result.stderr.trim());
-    }
-    fail(`${label}: verification script failed`);
+    const stderr = result.stderr.trim();
+    fail(`${label}: verification script failed${stderr ? `: ${stderr}` : ""}`);
   }
   if (result.stdout.trim() === "") {
     return [];
@@ -1434,7 +1464,7 @@ async function gradeRun({
   const gradingPath = path.join(runDir, "grading.json");
   if (evalCase.assertions.length === 0) {
     writeJson(gradingPath, emptyGrading());
-    return { message: null };
+    return { status: "graded 0/0" };
   }
 
   const outputDir = path.join(runDir, "outputs");
@@ -1477,7 +1507,7 @@ async function gradeRun({
   };
   writeJson(gradingPath, grading);
   return {
-    message: `${runTaskLabel({ evalDir, runConfiguration })}: graded ${grading.summary.passed}/${grading.summary.total}`,
+    status: `graded ${grading.summary.passed}/${grading.summary.total}`,
   };
 }
 
@@ -1712,8 +1742,6 @@ async function runOneConfiguration({
     const exitCode = result.exit_code ?? 1;
     return {
       exitCode,
-      message: `${runTaskLabel({ evalDir, runConfiguration })}: exit ${exitCode}`,
-      stderr: result.stderr,
     };
   } finally {
     fs.rmSync(sandboxRoot, { recursive: true, force: true });
@@ -1759,25 +1787,38 @@ async function runAllConfigurations({
   );
 
   const failures: string[] = [];
+  const runStatuses = new Map<string, string>();
   let exitCode = 0;
-  for (const index of sortedTaskIndexes(runTasks)) {
+  let hasFailedRun = false;
+  for (let index = 0; index < runTasks.length; index += 1) {
     const result = runResults[index];
     const task = runTasks[index];
     const label = runTaskLabel(task);
     if (result.status === "rejected") {
-      failures.push(
-        `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-      );
+      const message = `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`;
+      failures.push(message);
+      runStatuses.set(taskStatusKey(task), message);
+      hasFailedRun = true;
       continue;
     }
 
-    console.log(result.value.message);
-    if (result.value.stderr.trim()) {
-      console.error(result.value.stderr.trim());
-    }
+    runStatuses.set(taskStatusKey(task), `exit ${result.value.exitCode}`);
     if (result.value.exitCode !== 0 && exitCode === 0) {
       exitCode = result.value.exitCode;
     }
+    if (result.value.exitCode !== 0) {
+      hasFailedRun = true;
+    }
+  }
+
+  if (hasFailedRun) {
+    console.log(
+      formatGroupedTaskStatuses({
+        evals,
+        runConfigurations,
+        statuses: runStatuses,
+      }),
+    );
   }
 
   if (failures.length > 0) {
@@ -1801,7 +1842,7 @@ async function gradeAllRuns({
   model: string;
   runConfigurations: RunConfiguration[];
   skillPath: string;
-}): Promise<void> {
+}): Promise<boolean> {
   const gradeTasks: RunTask[] = evals.flatMap((evalCase) => {
     const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
     return runConfigurations.map((runConfiguration) => ({
@@ -1822,26 +1863,33 @@ async function gradeAllRuns({
     ),
   );
 
+  const gradeStatuses = new Map<string, string>();
   const failures: string[] = [];
-  for (const index of sortedTaskIndexes(gradeTasks)) {
+  for (let index = 0; index < gradeTasks.length; index += 1) {
+    const task = gradeTasks[index];
     const result = gradeResults[index];
     if (result.status === "fulfilled") {
-      if (result.value.message) {
-        console.log(result.value.message);
-      }
+      gradeStatuses.set(taskStatusKey(task), result.value.status);
       continue;
     }
 
-    const task = gradeTasks[index];
-    const label = runTaskLabel(task);
-    failures.push(
-      `${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-    );
+    const message =
+      result.reason instanceof Error
+        ? result.reason.message
+        : String(result.reason);
+    gradeStatuses.set(taskStatusKey(task), message);
+    failures.push(message);
   }
 
-  if (failures.length > 0) {
-    fail(failures.join("\n"));
-  }
+  console.log(
+    formatGroupedTaskStatuses({
+      evals,
+      runConfigurations,
+      statuses: gradeStatuses,
+    }),
+  );
+
+  return failures.length === 0;
 }
 
 async function main(): Promise<void> {
@@ -1893,7 +1941,7 @@ async function main(): Promise<void> {
     );
   }
 
-  await gradeAllRuns({
+  const gradingSucceeded = await gradeAllRuns({
     effort: args.effort,
     evals,
     iterationDir,
@@ -1901,14 +1949,13 @@ async function main(): Promise<void> {
     runConfigurations,
     skillPath,
   });
+  if (!gradingSucceeded) {
+    process.exitCode = 1;
+    return;
+  }
 
   writeBenchmark({ evals, iterationDir, runConfigurations });
   writeFeedbackJson({ evals, iterationDir });
-
-  console.log(`Saved eval workspace: ${iterationDir}`);
-  console.log(
-    "Next: review eval outputs and grading.json files, then record specific feedback in feedback.json.",
-  );
 }
 
 if (

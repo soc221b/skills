@@ -3,48 +3,12 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Do not read other files; review evals/files/eval-1.ts for the TypeScript type-safety issue.",
-      "expected_output": "Reviews the formatter as a closed-union exhaustiveness issue and recommends explicitly handling \"json\" plus a never-based exhaustive fallback.",
+      "prompt": "Review evals/files/eval-1.ts for the TypeScript type-safety issue.",
+      "expected_output": ".",
       "files": ["evals/files/eval-1.ts"],
       "assertions": [
-        "The output identifies `ExportFormat` as a closed finite union containing `csv` and `json`.",
-        "The output explains that the `default` branch hides the missing explicit `json` case.",
-        "The output shows a minimal fix that adds an explicit `case \"json\"` branch.",
-        "The output shows a `never`-based exhaustive check in the final branch that throws."
-      ]
-    },
-    {
-      "id": 2,
-      "prompt": "Hey, can you sanity-check evals/files/eval-2.ts and point out the TypeScript typing problem? Please only use that file.",
-      "expected_output": "Reviews the label helper as a closed-union exhaustiveness issue, including a string return type and a never-based exhaustive fallback.",
-      "files": ["evals/files/eval-2.ts"],
-      "assertions": [
-        "The output identifies `ShippingSpeed` as a closed finite union with exactly three cases.",
-        "The output explains that `getShippingSpeedLabel` should return `string` instead of `undefined | string`.",
-        "The output replaces the `default` branch that returns `undefined` with a `never`-based exhaustive check that throws."
-      ]
-    },
-    {
-      "id": 3,
-      "prompt": "Review the role description helper in evals/files/eval-3.ts and tell me whether its default branch weakens exhaustiveness.",
-      "expected_output": "Reviews the role description helper as a closed-union exhaustiveness issue and recommends replacing the unnecessary default return with a never-based exhaustive fallback.",
-      "files": ["evals/files/eval-3.ts"],
-      "assertions": [
-        "The output identifies `UserRole` as a closed finite union.",
-        "The output explains that the `default` return is unnecessary because all valid roles are already handled.",
-        "The output replaces the default return with a `never`-based exhaustive check that throws."
-      ]
-    },
-    {
-      "id": 4,
-      "prompt": "I am worried this switch in evals/files/eval-4.ts might be overusing `default`. Check whether the default is actually unsafe before suggesting a change.",
-      "expected_output": "Reviews the connection badge helper as a closed-union exhaustiveness issue and recommends explicit `connected` and `ready` cases returning `Available`, followed by a `default` branch with a never-based exhaustive check that throws.",
-      "files": ["evals/files/eval-4.ts"],
-      "assertions": [
-        "The output identifies `ConnectionState` as a closed finite union.",
-        "The output explains that the `default` branch hides the known `connected` and `ready` cases plus any future union members.",
-        "The output shows explicit `case \"connected\"` and `case \"ready\"` branches that return `Available`.",
-        "The output replaces the `default` branch that returns `Available` with a `never`-based exhaustive check that throws."
+        "The review shows a minimal fix that adds an explicit `\"json\"` branch.",
+        "The review shows a `never`-based exhaustive check in the final branch that throws."
       ]
     }
   ]

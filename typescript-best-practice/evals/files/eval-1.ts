@@ -1,10 +1,9 @@
 type ExportFormat = "csv" | "json";
 
 function getExportMimeType(format: ExportFormat): string {
-  switch (format) {
-    case "csv":
-      return "text/csv";
-    default:
-      return "application/octet-stream";
+  if (format === "csv") {
+    return "text/csv";
+  } else {
+    return "application/json";
   }
 }

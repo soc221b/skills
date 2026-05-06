@@ -159,10 +159,10 @@ test("run_skill_evals writes the documented workspace with baseline runs", (t) =
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-sample-1 with_skill: exit 0/);
-  assert.match(result.stdout, /eval-sample-1 without_skill: exit 0/);
-  assert.match(result.stdout, /eval-sample-1 with_skill: graded 1\/1/);
-  assert.match(result.stdout, /eval-sample-1 without_skill: graded 1\/1/);
+  assert.equal(
+    result.stdout,
+    "eval-sample-1\n   with_skill: graded 1/1\nwithout_skill: graded 1/1\n",
+  );
 
   const iterationDir = path.join(fixture.workspace, "iteration-1");
   const evalDir = path.join(iterationDir, "eval-sample-1");
@@ -305,8 +305,8 @@ process.stdout.write(JSON.stringify({
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-sample-1 with_skill: exit 0/);
-  assert.match(result.stdout, /eval-sample-1 without_skill: exit 0/);
+  assert.match(result.stdout, /eval-sample-1\n   with_skill: graded 1\/1/);
+  assert.doesNotMatch(result.stdout, /exit 0/);
 });
 
 test("run_skill_evals uses Codex for non-Claude models", (t) => {
@@ -345,8 +345,8 @@ test("run_skill_evals uses Codex for non-Claude models", (t) => {
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-sample-1 with_skill: exit 0/);
-  assert.match(result.stdout, /eval-sample-1 without_skill: exit 0/);
+  assert.match(result.stdout, /eval-sample-1\n   with_skill: graded 1\/1/);
+  assert.doesNotMatch(result.stdout, /exit 0/);
   assert.equal(
     fs.readFileSync(
       path.join(
@@ -420,8 +420,10 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /eval-skill-instructions-1 with_skill/);
-  assert.match(result.stdout, /eval-skill-instructions-1 without_skill/);
+  assert.equal(
+    result.stdout,
+    "eval-skill-instructions-1\n   with_skill: graded 0/0\nwithout_skill: graded 0/0\n",
+  );
   const grading = JSON.parse(
     fs.readFileSync(
       path.join(
@@ -738,7 +740,7 @@ process.stdout.write(JSON.stringify({
   );
 });
 
-test("run_skill_evals prints status lines in sorted order", (t) => {
+test("run_skill_evals prints grouped grading statuses in eval order", (t) => {
   const fixture = makeSkillFixture(t, {
     evalsJson: {
       skill_name: "example-skill",
@@ -818,20 +820,106 @@ process.stdout.write(JSON.stringify({
   );
 
   assert.equal(result.status, 0, result.stderr);
-  const statusLines = result.stdout
-    .trim()
-    .split(/\r?\n/)
-    .filter((line) => /: (exit|graded) /.test(line));
-  assert.deepEqual(statusLines, [
-    "eval-alpha-1 with_skill: exit 0",
-    "eval-alpha-1 without_skill: exit 0",
-    "eval-beta-2 with_skill: exit 0",
-    "eval-beta-2 without_skill: exit 0",
-    "eval-alpha-1 with_skill: graded 1/1",
-    "eval-alpha-1 without_skill: graded 1/1",
-    "eval-beta-2 with_skill: graded 1/1",
-    "eval-beta-2 without_skill: graded 1/1",
-  ]);
+  assert.equal(
+    result.stdout,
+    [
+      "eval-alpha-1",
+      "   with_skill: graded 1/1",
+      "without_skill: graded 1/1",
+      "",
+      "eval-beta-2",
+      "   with_skill: graded 1/1",
+      "without_skill: graded 1/1",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("run_skill_evals reports grading failures in the grouped summary", (t) => {
+  const assertion = "The output reports the expected issue.";
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review alpha.",
+          expected_output: "Reports the expected alpha issue.",
+          assertions: [assertion],
+        },
+        {
+          id: 2,
+          prompt: "Review beta.",
+          expected_output: "Reports the expected beta issue.",
+          assertions: [assertion],
+        },
+      ],
+    },
+  });
+  const fakeClaude = writeFakeClaude(
+    fixture.root,
+    `
+const prompt = process.argv.at(-1) || "";
+function currentRun() {
+  const match = prompt.match(/iteration-1\\/([^/\\n]+)\\/([^/\\n]+)\\/outputs/);
+  return {
+    evalName: match ? match[1] : "unknown",
+    configuration: match ? match[2] : "unknown"
+  };
+}
+if (prompt.includes("Grade this skill eval run")) {
+  const { evalName, configuration } = currentRun();
+  process.stdout.write(JSON.stringify({
+    result: JSON.stringify({
+      assertion_results: [
+        {
+          text: evalName === "eval-alpha-1" && configuration === "with_skill"
+            ? "Wrong assertion text."
+            : "The output reports the expected issue.",
+          passed: true,
+          evidence: "outputs/output.md identifies " + evalName + " " + configuration
+        }
+      ],
+      summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 }
+    }),
+    usage: { input_tokens: 1, output_tokens: 1 }
+  }) + "\\n");
+  process.exit(0);
+}
+process.stdout.write(JSON.stringify({
+  result: "review output\\n",
+  usage: { input_tokens: 1, output_tokens: 1 }
+}) + "\\n");
+`,
+  );
+
+  const result = runNode(
+    runScript,
+    [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
+    { env: { SKILL_EVAL_CLAUDE_BIN: fakeClaude } },
+  );
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "");
+  assert.equal(
+    result.stdout,
+    [
+      "eval-alpha-1",
+      "   with_skill: eval-alpha-1 with_skill grading.assertion_results[0].text must copy the assertion exactly",
+      "without_skill: graded 1/1",
+      "",
+      "eval-beta-2",
+      "   with_skill: graded 1/1",
+      "without_skill: graded 1/1",
+      "",
+    ].join("\n"),
+  );
+  assert.equal(
+    fs.existsSync(
+      path.join(fixture.workspace, "iteration-1", "benchmark.json"),
+    ),
+    false,
+  );
 });
 
 test("run_skill_evals aggregates multi-eval benchmark means, stddevs, and deltas", (t) => {
@@ -1169,8 +1257,10 @@ process.exit(7);
   );
 
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /eval-sample-1 with_skill: exit 7/);
-  assert.match(result.stdout, /eval-sample-1 without_skill: exit 7/);
+  assert.equal(
+    result.stdout,
+    "eval-sample-1\n   with_skill: exit 7\nwithout_skill: exit 7\n",
+  );
   assert.match(result.stderr, /not grading or benchmarking failed outputs/);
   const iterationDir = path.join(fixture.workspace, "iteration-1");
   const evalDir = path.join(iterationDir, "eval-sample-1");
