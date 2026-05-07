@@ -4,7 +4,6 @@
     {
       "id": 1,
       "prompt": "Review evals/files/eval-1.ts for the TypeScript type-safety issue.",
-      "expected_output": ".",
       "files": ["evals/files/eval-1.ts"],
       "assertions": [
         "The review shows a minimal fix that adds an explicit `\"json\"` branch.",

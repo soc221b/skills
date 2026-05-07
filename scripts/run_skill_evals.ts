@@ -13,7 +13,7 @@ type RunConfiguration = "with_skill" | BaselineConfiguration;
 type EvalCase = {
   id: number;
   prompt: string;
-  expected_output: string;
+  expected_output?: string;
   files: string[];
   assertions: string[];
 };
@@ -227,6 +227,16 @@ function assertStringArray(
   });
 }
 
+function assertNonEmptyStringArray(
+  value: unknown,
+  label: string,
+): asserts value is string[] {
+  assertStringArray(value, label);
+  if (value.length === 0) {
+    fail(`${label} must be a non-empty array`);
+  }
+}
+
 function validateInputFilePath(
   skillPath: string,
   file: string,
@@ -298,16 +308,20 @@ function loadEvals(skillPath: string): {
       ids.add(id);
 
       const prompt = rawEval.prompt;
-      const expectedOutput = rawEval.expected_output;
       assertString(prompt, `${label}.prompt`);
-      assertString(expectedOutput, `${label}.expected_output`);
+      const rawExpectedOutput = Object.hasOwn(rawEval, "expected_output")
+        ? rawEval.expected_output
+        : undefined;
+      let expectedOutput: string | undefined;
+      if (rawExpectedOutput !== undefined) {
+        assertString(rawExpectedOutput, `${label}.expected_output`);
+        expectedOutput = rawExpectedOutput;
+      }
 
       const files = Object.hasOwn(rawEval, "files") ? rawEval.files : [];
-      const assertions = Object.hasOwn(rawEval, "assertions")
-        ? rawEval.assertions
-        : [];
+      const assertions = rawEval.assertions;
       assertStringArray(files, `${label}.files`);
-      assertStringArray(assertions, `${label}.assertions`);
+      assertNonEmptyStringArray(assertions, `${label}.assertions`);
 
       files.forEach((file, fileIndex) => {
         validateInputFilePath(skillPath, file, `${label}.files[${fileIndex}]`);
@@ -1172,15 +1186,17 @@ function buildGradingPrompt({
   evalCase: EvalCase;
   outputDir: string;
 }): string {
+  const expectedOutputSection = evalCase.expected_output
+    ? `\nExpected output:\n${evalCase.expected_output}\n`
+    : "";
+
   return `Grade this skill eval run against its assertions.
 
 Use only the files in the output directory and the output inventory below. Grade each assertion directly and require concrete evidence for every PASS or FAIL. If the output only gestures at an assertion without satisfying its substance, mark it failed.
 
 Task prompt:
 ${evalCase.prompt}
-
-Expected output:
-${evalCase.expected_output}
+${expectedOutputSection}
 
 Output directory:
 ${outputDir}

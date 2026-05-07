@@ -374,6 +374,7 @@ test("run_skill_evals derives semantic names for file-only prompts", (t) => {
           expected_output:
             'Reviews the formatter as a closed-union exhaustiveness issue and recommends explicitly handling "json" plus a never-based exhaustive fallback.',
           files: ["evals/files/eval-1.ts"],
+          assertions: ["The output reports the expected issue."],
         },
       ],
     },
@@ -399,7 +400,7 @@ test("run_skill_evals derives semantic names for file-only prompts", (t) => {
   ]);
 });
 
-test("run_skill_evals accepts evals without optional files or assertions", (t) => {
+test("run_skill_evals accepts evals without optional files or expected_output", (t) => {
   const fixture = makeSkillFixture(t, {
     evalsJson: {
       skill_name: "example-skill",
@@ -407,7 +408,7 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
         {
           id: 1,
           prompt: "Review the skill instructions.",
-          expected_output: "Reports the expected issue.",
+          assertions: ["The output reports the expected issue."],
         },
       ],
     },
@@ -422,7 +423,7 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
-    "eval-skill-instructions-1\n   with_skill: graded 0/0\nwithout_skill: graded 0/0\n",
+    "eval-skill-instructions-1\n   with_skill: graded 1/1\nwithout_skill: graded 1/1\n",
   );
   const grading = JSON.parse(
     fs.readFileSync(
@@ -437,8 +438,14 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
     ),
   );
   assert.deepEqual(grading, {
-    assertion_results: [],
-    summary: { passed: 0, failed: 0, total: 0, pass_rate: null },
+    assertion_results: [
+      {
+        text: "The output reports the expected issue.",
+        passed: true,
+        evidence: "outputs/output.md contains review output",
+      },
+    ],
+    summary: { passed: 1, failed: 0, total: 1, pass_rate: 1 },
   });
   assert.ok(
     fs.existsSync(
@@ -451,6 +458,33 @@ test("run_skill_evals accepts evals without optional files or assertions", (t) =
         "output.md",
       ),
     ),
+  );
+});
+
+test("run_skill_evals rejects evals without required assertions", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review the skill instructions.",
+        },
+      ],
+    },
+  });
+
+  const result = runNode(
+    runScript,
+    [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
+    { env: { SKILL_EVAL_CLAUDE_BIN: writeFakeClaude(fixture.root) } },
+  );
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ERROR: evals\[0\]\.assertions must be an array/);
+  assert.equal(
+    fs.existsSync(path.join(fixture.workspace, "iteration-1")),
+    false,
   );
 });
 

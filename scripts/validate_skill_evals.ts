@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 type EvalCase = {
   id: number;
   prompt: string;
-  expected_output: string;
+  expected_output?: string;
   files: string[];
   assertions: string[];
 };
@@ -121,6 +121,16 @@ function assertStringArray(
   });
 }
 
+function assertNonEmptyStringArray(
+  value: unknown,
+  label: string,
+): asserts value is string[] {
+  assertStringArray(value, label);
+  if (value.length === 0) {
+    fail(`${label} must be a non-empty array`);
+  }
+}
+
 function validateInputFilePath(
   skillPath: string,
   file: string,
@@ -187,15 +197,19 @@ export function loadAndValidateEvals(skillPath: string): EvalCase[] {
     ids.add(id);
 
     const prompt = evalCase.prompt;
-    const expectedOutput = evalCase.expected_output;
     assertString(prompt, `${label}.prompt`);
-    assertString(expectedOutput, `${label}.expected_output`);
+    const rawExpectedOutput = Object.hasOwn(evalCase, "expected_output")
+      ? evalCase.expected_output
+      : undefined;
+    let expectedOutput: string | undefined;
+    if (rawExpectedOutput !== undefined) {
+      assertString(rawExpectedOutput, `${label}.expected_output`);
+      expectedOutput = rawExpectedOutput;
+    }
     const files = Object.hasOwn(evalCase, "files") ? evalCase.files : [];
-    const assertions = Object.hasOwn(evalCase, "assertions")
-      ? evalCase.assertions
-      : [];
+    const assertions = evalCase.assertions;
     assertStringArray(files, `${label}.files`);
-    assertStringArray(assertions, `${label}.assertions`);
+    assertNonEmptyStringArray(assertions, `${label}.assertions`);
 
     for (const [fileIndex, file] of files.entries()) {
       validateInputFilePath(skillPath, file, `${label}.files[${fileIndex}]`);

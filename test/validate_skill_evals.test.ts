@@ -70,6 +70,29 @@ test("validate_skill_evals accepts evals without optional files", (t) => {
   assertValidationSuccess(result);
 });
 
+test("validate_skill_evals accepts evals without optional expected_output", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review evals/files/sample.ts.",
+          files: ["evals/files/sample.ts"],
+          assertions: ["The output reports the expected issue."],
+        },
+      ],
+    },
+    files: {
+      "evals/files/sample.ts": "const value = 1;\n",
+    },
+  });
+
+  const result = runNode(validateScript, [], { cwd: fixture.root });
+
+  assertValidationSuccess(result);
+});
+
 test("validate_skill_evals rejects non-integer eval IDs", (t) => {
   const fixture = makeSkillFixture(t, {
     evalsJson: {
@@ -91,7 +114,7 @@ test("validate_skill_evals rejects non-integer eval IDs", (t) => {
   assertValidationFailure(result, "evals[0].id must be a unique integer");
 });
 
-test("validate_skill_evals accepts evals without optional assertions", (t) => {
+test("validate_skill_evals rejects missing assertions", (t) => {
   const fixture = makeSkillFixture(t, {
     evalsJson: {
       skill_name: "example-skill",
@@ -111,7 +134,34 @@ test("validate_skill_evals accepts evals without optional assertions", (t) => {
 
   const result = runNode(validateScript, [], { cwd: fixture.root });
 
-  assertValidationSuccess(result);
+  assertValidationFailure(result, "evals[0].assertions must be an array");
+});
+
+test("validate_skill_evals rejects empty assertions", (t) => {
+  const fixture = makeSkillFixture(t, {
+    evalsJson: {
+      skill_name: "example-skill",
+      evals: [
+        {
+          id: 1,
+          prompt: "Review evals/files/sample.ts.",
+          expected_output: "Reports the expected issue.",
+          files: ["evals/files/sample.ts"],
+          assertions: [],
+        },
+      ],
+    },
+    files: {
+      "evals/files/sample.ts": "const value = 1;\n",
+    },
+  });
+
+  const result = runNode(validateScript, [], { cwd: fixture.root });
+
+  assertValidationFailure(
+    result,
+    "evals[0].assertions must be a non-empty array",
+  );
 });
 
 test("validate_skill_evals rejects malformed assertions", (t) => {
