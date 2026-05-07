@@ -6,8 +6,7 @@
       "prompt": "Review evals/files/eval-1.ts for the TypeScript type-safety issue.",
       "files": ["evals/files/eval-1.ts"],
       "assertions": [
-        "The review shows a minimal fix that adds an explicit `\"json\"` branch.",
-        "The review shows a `never`-based exhaustive check in the final branch that throws."
+        "All of the review's recommended approaches should produce a compile error when `ExportFormat` is expanded or shrunk."
       ]
     }
   ]
