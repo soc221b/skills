@@ -1338,61 +1338,7 @@ test("typescript eval 4 fixture expects explicit available cases", () => {
   assert.match(evalCase.expected_output, /never-based exhaustive check/);
 });
 
-test("typescript verifier checks eval 4 explicit available case assertions", (t) => {
-  const assertion =
-    'The output shows explicit `case "connected"` and `case "ready"` branches that return `Available`.';
-  const fixture = makeSkillFixture(t, {
-    evalsJson: {
-      skill_name: "example-skill",
-      evals: [
-        {
-          id: 4,
-          prompt: "Review evals/files/eval-4.ts.",
-          expected_output:
-            "Recommends explicit connected and ready cases that return Available.",
-          files: ["evals/files/eval-4.ts"],
-          assertions: [assertion],
-        },
-      ],
-    },
-    files: {
-      "evals/files/eval-4.ts":
-        'type ConnectionState = "connecting" | "connected" | "reconnecting" | "ready";\n',
-    },
-  });
-  const outputDir = path.join(fixture.root, "outputs");
-  fs.mkdirSync(outputDir);
-  fs.writeFileSync(
-    path.join(outputDir, "output.md"),
-    'Use case "connected": and case "ready":, then return "Available".\n',
-  );
-
-  const result = runNode(
-    path.join(repoRoot, "typescript-best-practice", "evals", "verify.cjs"),
-    [
-      "--evals-json",
-      path.join(fixture.skillPath, "evals", "evals.json"),
-      "--eval-id",
-      "4",
-      "--output-dir",
-      outputDir,
-    ],
-  );
-
-  assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), {
-    assertion_results: [
-      {
-        text: assertion,
-        passed: true,
-        evidence:
-          'Checked for explicit case "connected" and case "ready" branches returning Available.',
-      },
-    ],
-  });
-});
-
-test("run_skill_evals uses deterministic verification scripts before LLM grading", (t) => {
+test("run_skill_evals ignores legacy verification scripts", (t) => {
   const assertion = "The output reports the expected issue.";
   const fixture = makeSkillFixture(t, {
     evalsJson: {
@@ -1409,51 +1355,10 @@ test("run_skill_evals uses deterministic verification scripts before LLM grading
     },
     files: {
       "evals/files/sample.ts": "const value = 1;\n",
-      "evals/verify.cjs": `
-const fs = require("node:fs");
-const evalsJsonPath = process.argv[process.argv.indexOf("--evals-json") + 1];
-const evalId = Number(process.argv[process.argv.indexOf("--eval-id") + 1]);
-const runConfiguration =
-  process.argv[process.argv.indexOf("--run-configuration") + 1];
-const evalsJson = JSON.parse(fs.readFileSync(evalsJsonPath, "utf8"));
-const evalCase = evalsJson.evals.find((candidate) => candidate.id === evalId);
-process.stdout.write(JSON.stringify({
-  assertion_results: evalCase.assertions.map((text) => ({
-    text,
-    passed: true,
-    evidence: "Verified mechanically for " + runConfiguration
-  }))
-}) + "\\n");
-`,
+      "evals/verify.cjs": "process.exit(42);\n",
     },
   });
-
-  const fakeClaude = writeFakeClaude(
-    fixture.root,
-    `
-const prompt = process.argv.at(-1) || "";
-if (prompt.includes("Grade this skill eval run")) {
-  process.stderr.write("LLM grading should not run\\n");
-  process.exit(42);
-}
-if (prompt.includes("Blindly compare skill eval outputs")) {
-  process.stdout.write(JSON.stringify({
-    result: JSON.stringify({
-      preferred_output: "tie",
-      scores: { A: 3, B: 3 },
-      rationale: "Both outputs are equivalent.",
-      actionable_feedback: ""
-    }),
-    usage: { input_tokens: 1, output_tokens: 1 }
-  }) + "\\n");
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  result: "review output\\n",
-  usage: { input_tokens: 10, output_tokens: 5 }
-}) + "\\n");
-`,
-  );
+  const fakeClaude = writeFakeClaude(fixture.root);
 
   const result = runNode(
     runScript,
@@ -1478,131 +1383,9 @@ process.stdout.write(JSON.stringify({
     {
       text: assertion,
       passed: true,
-      evidence: "Verified mechanically for with_skill",
+      evidence: "outputs/output.md contains review output",
     },
   ]);
-});
-
-test("run_skill_evals combines partial deterministic grading with LLM grading in assertion order", (t) => {
-  const llmAssertion = "The output describes the human-facing issue.";
-  const deterministicAssertion = "The output includes the required marker.";
-  const fixture = makeSkillFixture(t, {
-    evalsJson: {
-      skill_name: "example-skill",
-      evals: [
-        {
-          id: 1,
-          prompt: "Review fixture behavior.",
-          expected_output: "Reports the expected issue and marker.",
-          files: ["evals/files/sample.ts"],
-          assertions: [llmAssertion, deterministicAssertion],
-        },
-      ],
-    },
-    files: {
-      "evals/files/sample.ts": "const value = 1;\n",
-      "evals/verify.cjs": `
-const fs = require("node:fs");
-const evalsJsonPath = process.argv[process.argv.indexOf("--evals-json") + 1];
-const evalId = Number(process.argv[process.argv.indexOf("--eval-id") + 1]);
-const runConfiguration =
-  process.argv[process.argv.indexOf("--run-configuration") + 1];
-const evalsJson = JSON.parse(fs.readFileSync(evalsJsonPath, "utf8"));
-const evalCase = evalsJson.evals.find((candidate) => candidate.id === evalId);
-const assertion = evalCase.assertions.find((text) => text.includes("marker"));
-process.stdout.write(JSON.stringify({
-  assertion_results: [
-    {
-      text: assertion,
-      passed: true,
-      evidence: "Verified marker mechanically for " + runConfiguration
-    }
-  ]
-}) + "\\n");
-`,
-    },
-  });
-
-  const fakeClaude = writeFakeClaude(
-    fixture.root,
-    `
-const prompt = process.argv.at(-1) || "";
-if (prompt.includes("Grade this skill eval run")) {
-  if (prompt.includes("The output includes the required marker.")) {
-    process.stderr.write("deterministic assertion should not be LLM graded\\n");
-    process.exit(42);
-  }
-  process.stdout.write(JSON.stringify({
-    result: JSON.stringify({
-      assertion_results: [
-        {
-          text: "The output describes the human-facing issue.",
-          passed: false,
-          evidence: "outputs/output.md omits the human-facing explanation"
-        }
-      ],
-      summary: { passed: 0, failed: 1, total: 1, pass_rate: 0 }
-    }),
-    usage: { input_tokens: 1, output_tokens: 1 }
-  }) + "\\n");
-  process.exit(0);
-}
-if (prompt.includes("Blindly compare skill eval outputs")) {
-  process.stdout.write(JSON.stringify({
-    result: JSON.stringify({
-      preferred_output: "tie",
-      scores: { A: 3, B: 3 },
-      rationale: "Both outputs are equivalent.",
-      actionable_feedback: ""
-    }),
-    usage: { input_tokens: 1, output_tokens: 1 }
-  }) + "\\n");
-  process.exit(0);
-}
-process.stdout.write(JSON.stringify({
-  result: "review output with marker\\n",
-  usage: { input_tokens: 1, output_tokens: 1 }
-}) + "\\n");
-`,
-  );
-
-  const result = runNode(
-    runScript,
-    [fixture.skillPath, "--workspace", fixture.workspace, "--iteration", "1"],
-    { env: { SKILL_EVAL_CLAUDE_BIN: fakeClaude } },
-  );
-
-  assert.equal(result.status, 0, result.stderr);
-  const grading = JSON.parse(
-    fs.readFileSync(
-      path.join(
-        fixture.workspace,
-        "iteration-1",
-        "eval-fixture-behavior-1",
-        "with_skill",
-        "grading.json",
-      ),
-      "utf8",
-    ),
-  );
-  assert.deepEqual(grading.assertion_results, [
-    {
-      text: llmAssertion,
-      passed: false,
-      evidence: "outputs/output.md omits the human-facing explanation",
-    },
-    {
-      text: deterministicAssertion,
-      passed: true,
-      evidence: "Verified marker mechanically for with_skill",
-    },
-  ]);
-  assert.deepEqual(grading.summary, {
-    passed: 1,
-    failed: 1,
-    total: 2,
-    pass_rate: 0.5,
-  });
 });
 
 test("run_skill_evals requires an old skill path when no workspace snapshot exists", (t) => {

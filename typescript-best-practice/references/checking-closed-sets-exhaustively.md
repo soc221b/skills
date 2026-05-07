@@ -1,1 +1,0 @@
-# Checking Closed Sets Exhaustively

@@ -8,6 +8,34 @@
       "assertions": [
         "All of the review's recommended approaches should produce a compile error when `ExportFormat` is expanded or shrunk."
       ]
+    },
+    {
+      "id": 2,
+      "prompt": "Review evals/files/eval-2.ts.",
+      "files": ["evals/files/eval-2.ts"],
+      "assertions": [
+        "All of the review's recommended approaches should produce a compile error when `ShippingSpeed` is expanded or shrunk.",
+        "All of the review's recommended approaches should result in a string type for the return value."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Review evals/files/eval-3.ts.",
+      "files": ["evals/files/eval-3.ts"],
+      "assertions": [
+        "All of the review's recommended approaches should produce a compile error when `UserRole` is expanded or shrunk.",
+        "All of the review's recommended approaches should avoid keeping `No permissions assigned`."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Review evals/files/eval-4.ts.",
+      "expected_output": "Recommends explicit `connected` and `ready` cases that use `Available` as the label, plus a never-based exhaustive check for future connection states.",
+      "files": ["evals/files/eval-4.ts"],
+      "assertions": [
+        "All of the review's recommended approaches should produce a compile error when `ConnectionState` is expanded or shrunk.",
+        "All of the review's recommended approaches should use `Available` as the label for both `connected` and `ready` states."
+      ]
     }
   ]
 }

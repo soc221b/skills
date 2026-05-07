@@ -128,13 +128,6 @@ Options:
 Test cases are read from <skill-path>/evals/evals.json.
 Claude models run with Claude Code; other models run with Codex.
 Set SKILL_EVAL_CLAUDE_BIN or SKILL_EVAL_CODEX_BIN to choose the executable used for isolated runs.
-
-Optional deterministic grading hook:
-  <skill-path>/evals/verify.mjs, verify.js, or verify.cjs
-  The script is invoked with --evals-json, --eval-id, --output-dir,
-  --run-configuration, and --skill-path. It should print JSON containing
-  assertion_results for any assertions it can verify mechanically; remaining
-  assertions are LLM-graded.
 `);
 }
 
@@ -650,16 +643,6 @@ function prepareOldSkillSnapshot({
     provenance: "copied_from_supplied_snapshot",
     source_path: oldSkillPath,
   };
-}
-
-function verificationScriptPath(skillPath: string): string | null {
-  for (const fileName of ["verify.mjs", "verify.js", "verify.cjs"]) {
-    const candidate = path.join(skillPath, "evals", fileName);
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return null;
 }
 
 function copyInputFiles(
@@ -1226,41 +1209,6 @@ Return only valid JSON with this exact shape and no markdown:
 `;
 }
 
-function invokeNodeScript({
-  args,
-  cwd,
-  scriptPath,
-}: {
-  args: string[];
-  cwd: string;
-  scriptPath: string;
-}): Promise<{
-  exit_code: number | null;
-  stderr: string;
-  stdout: string;
-}> {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [scriptPath, ...args], {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
-    child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
-    child.on("error", (error) => {
-      stderrChunks.push(Buffer.from(`${error.message}\n`));
-    });
-    child.on("close", (exitCode) => {
-      resolve({
-        exit_code: exitCode,
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-      });
-    });
-  });
-}
-
 function parseJsonObjectFromText(text: string, label: string): unknown {
   const trimmed = text.trim();
   try {
@@ -1330,53 +1278,6 @@ function normalizeGradingJson(
   };
 }
 
-function normalizeVerificationJson(
-  value: unknown,
-  assertions: string[],
-  label: string,
-): AssertionResult[] {
-  assertRecord(value, label);
-  const rawResults = value.assertion_results;
-  if (!Array.isArray(rawResults)) {
-    fail(`${label}.assertion_results must be an array`);
-  }
-
-  const allowedAssertions = new Set(assertions);
-  const seenAssertions = new Set<string>();
-  return rawResults.map((rawResult, index) => {
-    assertRecord(rawResult, `${label}.assertion_results[${index}]`);
-    assertAllowedKeys(rawResult, `${label}.assertion_results[${index}]`, [
-      "text",
-      "passed",
-      "evidence",
-    ]);
-
-    const text = rawResult.text;
-    const passed = rawResult.passed;
-    const evidence = rawResult.evidence;
-    assertString(text, `${label}.assertion_results[${index}].text`);
-    if (!allowedAssertions.has(text)) {
-      fail(
-        `${label}.assertion_results[${index}].text does not match an eval assertion`,
-      );
-    }
-    if (seenAssertions.has(text)) {
-      fail(`${label}.assertion_results[${index}].text duplicates an assertion`);
-    }
-    seenAssertions.add(text);
-    if (typeof passed !== "boolean") {
-      fail(`${label}.assertion_results[${index}].passed must be a boolean`);
-    }
-    assertString(evidence, `${label}.assertion_results[${index}].evidence`);
-
-    return {
-      text,
-      passed,
-      evidence,
-    };
-  });
-}
-
 async function gradeAssertionsWithLlm({
   assertions,
   effort,
@@ -1413,68 +1314,18 @@ async function gradeAssertionsWithLlm({
     .assertion_results;
 }
 
-async function runVerificationScript({
-  evalCase,
-  evalDir,
-  outputDir,
-  runConfiguration,
-  skillPath,
-}: {
-  evalCase: EvalCase;
-  evalDir: string;
-  outputDir: string;
-  runConfiguration: RunConfiguration;
-  skillPath: string;
-}): Promise<AssertionResult[]> {
-  const scriptPath = verificationScriptPath(skillPath);
-  if (!scriptPath) {
-    return [];
-  }
-
-  const evalsJsonPath = path.join(skillPath, evalsFileName);
-  const label = `${path.basename(evalDir)} ${runConfiguration} verification`;
-  const result = await invokeNodeScript({
-    args: [
-      "--evals-json",
-      evalsJsonPath,
-      "--eval-id",
-      String(evalCase.id),
-      "--output-dir",
-      outputDir,
-      "--run-configuration",
-      runConfiguration,
-      "--skill-path",
-      skillPath,
-    ],
-    cwd: skillPath,
-    scriptPath,
-  });
-  if (result.exit_code !== 0) {
-    const stderr = result.stderr.trim();
-    fail(`${label}: verification script failed${stderr ? `: ${stderr}` : ""}`);
-  }
-  if (result.stdout.trim() === "") {
-    return [];
-  }
-
-  const parsed = parseJsonObjectFromText(result.stdout, label);
-  return normalizeVerificationJson(parsed, evalCase.assertions, label);
-}
-
 async function gradeRun({
   effort,
   evalCase,
   evalDir,
   model,
   runConfiguration,
-  skillPath,
 }: {
   effort: string;
   evalCase: EvalCase;
   evalDir: string;
   model: string;
   runConfiguration: RunConfiguration;
-  skillPath: string;
 }): Promise<GradeOutcome> {
   const runDir = path.join(evalDir, runConfiguration);
   const gradingPath = path.join(runDir, "grading.json");
@@ -1484,38 +1335,13 @@ async function gradeRun({
   }
 
   const outputDir = path.join(runDir, "outputs");
-  const deterministicResults = await runVerificationScript({
-    evalCase,
-    evalDir,
-    outputDir,
-    runConfiguration,
-    skillPath,
-  });
-  const deterministicByText = new Map(
-    deterministicResults.map((result) => [result.text, result]),
-  );
-  const remainingAssertions = evalCase.assertions.filter(
-    (assertion) => !deterministicByText.has(assertion),
-  );
-  const llmResults = await gradeAssertionsWithLlm({
-    assertions: remainingAssertions,
+  const assertionResults = await gradeAssertionsWithLlm({
+    assertions: evalCase.assertions,
     effort,
     evalCase,
     model,
     outputDir,
     label: `${path.basename(evalDir)} ${runConfiguration}`,
-  });
-  const llmByText = new Map(llmResults.map((result) => [result.text, result]));
-
-  const assertionResults = evalCase.assertions.map((assertion) => {
-    const result =
-      deterministicByText.get(assertion) ?? llmByText.get(assertion);
-    if (!result) {
-      fail(
-        `${path.basename(evalDir)} ${runConfiguration}: missing grade for assertion "${assertion}"`,
-      );
-    }
-    return result;
   });
   const grading: GradingJson = {
     assertion_results: assertionResults,
@@ -1850,14 +1676,12 @@ async function gradeAllRuns({
   iterationDir,
   model,
   runConfigurations,
-  skillPath,
 }: {
   effort: string;
   evals: EvalCase[];
   iterationDir: string;
   model: string;
   runConfigurations: RunConfiguration[];
-  skillPath: string;
 }): Promise<boolean> {
   const gradeTasks: RunTask[] = evals.flatMap((evalCase) => {
     const evalDir = path.join(iterationDir, evalDirectoryName(evalCase));
@@ -1874,7 +1698,6 @@ async function gradeAllRuns({
         ...task,
         effort,
         model,
-        skillPath,
       }),
     ),
   );
@@ -1963,7 +1786,6 @@ async function main(): Promise<void> {
     iterationDir,
     model: args.model,
     runConfigurations,
-    skillPath,
   });
   if (!gradingSucceeded) {
     process.exitCode = 1;
